@@ -1,0 +1,26 @@
+[project]
+name = "wechat-mcp"
+version = "0.2.0"
+description = "WeChat MCP Server - 面向通用 AI Agent 的微信桌面自动化工具服务"
+requires-python = ">=3.10"
+dependencies = ["mcp>=2"]
+
+[project.scripts]
+wechat-mcp = "wechat_mcp.server:main"
+
+[project.optional-dependencies]
+# 微信桌面自动化所需的运行时依赖（仅在目标 Windows 环境安装）。
+# 适配层默认从 deepseekgirl 复用 WeChatBridge，故需要其依赖可用。
+wechat = [
+    "loguru>=0.7",
+    "wechatauto-replica==1.2.2.6",
+    "wxauto4==41.1.7",
+    "uiautomation==2.0.29",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

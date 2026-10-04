@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "wechat": {
+      "command": "F:\\Code\\wechat-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "wechat_mcp.server"],
+      "env": {
+        "DEEPSEEKGIRL_PATH": "F:\\Code\\deepseekgirl-main",
+        "WECHAT_BACKEND": "auto",
+        "WECHAT_SEND_TIMEOUT": "20",
+        "WECHAT_LISTEN_ON_CONNECT": "1",
+        "WECHAT_SEND_DIRS": "",
+        "WECHAT_REQUIRE_CONFIRM": "0",
+        "WECHAT_AUDIT_ENABLED": "1",
+        "WECHAT_MONITOR_MODE": "allow",
+        "WECHAT_MONITOR_ALLOW": "",
+        "WECHAT_MONITOR_BLOCK": ""
+      }
+    }
+  }
+}
