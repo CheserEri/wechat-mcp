@@ -34,6 +34,35 @@
 
 ## 安装
 
+### 方式一：预编译独立包（推荐，无需 Python）
+
+从 [GitHub Releases](https://github.com/CheserEri/wechat-mcp/releases) 下载
+`wechat-mcp-win32-x64.zip`，解压后直接把 `wechat-mcp.exe` 配到 MCP 客户端即可：
+
+```json
+{
+  "mcpServers": {
+    "wechat": {
+      "command": "D:\\path\\to\\wechat-mcp\\wechat-mcp.exe",
+      "args": []
+    }
+  }
+}
+```
+
+该包已内置微信桥接模块，**不依赖 `DEEPSEEKGIRL_PATH`**。
+
+### 方式二：DeepSeek Harness 插件（输入名称即安装）
+
+```sh
+dsh plugin --profile web add dsh-wechat-mcp
+```
+
+插件包见 [dsh-plugin/](dsh-plugin/)，运行时随 npm 包分发，微信工具以
+`mcp__wechat__*` 暴露给模型。详见 [dsh-plugin/README.md](dsh-plugin/README.md)。
+
+### 方式三：源码运行（开发用）
+
 环境要求：Windows 10/11 x64、Python 3.10+。
 
 ```powershell
@@ -43,8 +72,8 @@ python -m venv .venv
 ```
 
 `[wechat]` 会安装微信自动化所需的运行时依赖（`wechatauto-replica`、`wxauto4`、
-`uiautomation`、`loguru`）。适配层默认从 `DEEPSEEKGIRL_PATH` 指定的项目复用
-`WeChatBridge`。
+`uiautomation`、`loguru`）。源码模式下适配层从 `DEEPSEEKGIRL_PATH` 指定的项目复用
+`WeChatBridge`；冻结打包时会自动内置该模块。
 
 ## 配置
 
@@ -118,11 +147,37 @@ python -m venv .venv
 .venv\Scripts\python.exe scripts\phase4_live_check.py
 ```
 
+## 构建与发布
+
+```powershell
+# 1. 生成独立运行时（onedir + zip），产物在 dist\
+.venv\Scripts\python.exe packaging\build.py
+
+# 2. 把运行时内置进 DSH 插件包
+node dsh-plugin\scripts\stage-runtime.mjs
+
+# 3. 发布 GitHub Release（需已登录 gh）
+gh release create v0.3.0 dist\wechat-mcp-win32-x64.zip --title "v0.3.0" --notes "…"
+
+# 4. 发布 npm 插件（prepack 会自动执行第 2 步）
+cd dsh-plugin
+npm publish --access public
+```
+
+> 打包会把**仓库内**的 `packaging/wechat_bridge.py`（从上游
+> `deepseekgirl` 收录，来源与授权说明见
+> [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）内置进 exe，
+> 因此构建不再依赖外部 `DEEPSEEKGIRL_PATH`，仓库 CI 可自动构建。
+>
+> 发布 npm 后，在 GitHub 仓库的 About → Topics 中添加 `dsh-plugin`，
+> 插件即会被 DSH 社区索引收录。
+
 ## 文档
 
 - [docs/TOOL_REFERENCE.md](docs/TOOL_REFERENCE.md) — 工具接口与环境变量
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 故障排查
 - [docs/E2E_TEST_RECORD.md](docs/E2E_TEST_RECORD.md) — 端到端测试记录
+- [dsh-plugin/README.md](dsh-plugin/README.md) — DeepSeek Harness 插件安装与说明
 - [CHANGELOG.md](CHANGELOG.md) — 版本与变更记录
 
 ## 第三方自动化风险

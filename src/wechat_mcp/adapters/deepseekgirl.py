@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
 import sys
 import threading
 from collections import deque
@@ -62,12 +63,46 @@ _STATUS_MAP: dict[str, ConnectionState] = {
 }
 
 
+def _bundled_bridge_file() -> Path | None:
+    """返回随包内置的 ``wechat_bridge.py`` 路径。
+
+    冻结打包（PyInstaller）时该文件被作为数据文件内置到解包目录，
+    使分发的 exe 无需外部 deepseekgirl 项目即可运行；源码模式下返回 ``None``。
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return None
+    candidate = Path(base) / "wechat_bridge.py"
+    return candidate if candidate.is_file() else None
+
+
+def _load_bridge_from_file(module_file: Path) -> Any:
+    """按文件路径加载 ``wechat_bridge`` 模块，避免污染 ``sys.path``。"""
+    spec = importlib.util.spec_from_file_location("wechat_bridge", module_file)
+    if spec is None or spec.loader is None:
+        raise BackendUnavailableError(
+            f"无法加载内置微信桥接模块: {module_file}",
+            detail={"module_file": str(module_file)},
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["wechat_bridge"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_wechat_bridge(project_path: Path) -> type:
-    """从 deepseekgirl 项目加载 ``WeChatBridge`` 类。
+    """加载 ``WeChatBridge`` 类。
+
+    优先使用随包内置的副本（冻结打包时存在），使分发的 exe 无需外部项目；
+    否则回退到 ``DEEPSEEKGIRL_PATH`` 指定的源码项目。
 
     仅加载 ``wechat_bridge`` 模块本身（它只依赖标准库与 loguru），
     不会触发原项目的机器人业务模块导入。
     """
+    bundled = _bundled_bridge_file()
+    if bundled is not None:
+        return _load_bridge_from_file(bundled).WeChatBridge
+
     src_dir = Path(project_path) / "src"
     module_file = src_dir / "wechat_bridge.py"
     if not module_file.is_file():
