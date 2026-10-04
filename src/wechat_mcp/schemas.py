@@ -67,6 +67,14 @@ class MessageRecord:
     message_id: str = ""
     # 适配层内单调递增序号，用于 get_recent_messages 的增量游标。
     seq: int = 0
+    # 是否 @ 当前登录账号（透传上游 WeChatMessage.is_at_me）。
+    is_at_me: bool = False
+    # 引用/回复消息中被引用者的显示名；非引用消息为空串。
+    reply_to_name: str = ""
+    # 会话原始 ID（群聊形如 ``xxxx@chatroom``，私聊为 wxid）。
+    # ``chat`` 是显示名，可能因解析失败退化成 ID；本字段始终是稳定标识，
+    # 供引擎做历史分桶 / 冷却 / 群范围匹配。
+    chat_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(asdict(self))

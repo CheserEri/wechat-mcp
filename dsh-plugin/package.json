@@ -1,6 +1,6 @@
 {
   "name": "dsh-wechat-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "DeepSeek Harness (DSH) 插件：通过官方 MCP 客户端桥接本机微信桌面自动化服务（Windows）。",
   "type": "module",
   "license": "MPL-2.0",

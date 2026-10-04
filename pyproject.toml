@@ -1,12 +1,13 @@
 [project]
 name = "wechat-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "WeChat MCP Server - 面向通用 AI Agent 的微信桌面自动化工具服务"
 requires-python = ">=3.10"
 dependencies = ["mcp>=2"]
 
 [project.scripts]
 wechat-mcp = "wechat_mcp.server:main"
+wechat-mcp-desktop = "wechat_mcp.desktop:run"
 
 [project.optional-dependencies]
 # 微信桌面自动化所需的运行时依赖（仅在目标 Windows 环境安装）。

@@ -2,6 +2,51 @@
 
 本项目遵循语义化版本号。日期格式为 `YYYY-MM-DD`。
 
+## [0.4.0] - 2026-10-04
+
+阶段 6：实时自动回复桌面助手。
+
+### 新增
+
+- 新增桌面应用（pywebview + WebView2，DSH 风格界面）：
+  - `.venv\Scripts\python.exe -m wechat_mcp.desktop`，或独立 exe 加 `--gui`。
+  - 页面：运行状态、群聊设置、模型设置、人设、运行日志。
+- 新增实时触发：消息到达即处理，无需 Agent 轮询。
+  - 群聊：@我 或 引用/回复我的消息；私聊：每条入站消息（开关可配）。
+  - 命中后取该会话最近 N 条上下文（默认 10）+ 人设（可为空）发给大模型并回复。
+- 新增 OpenAI 兼容模型客户端（默认 DeepSeek），界面可改 API 地址/Key/模型/
+  temperature/max_tokens；含「测试连接」。
+- 人设默认**留空**（不注入 system 提示词），支持界面编辑、保存与清空
+  （留空即不注入人设）。
+- 同一发送者冷却（默认 3 秒）与消息去重，避免刷屏与重复回复。
+- 新增会话延续：刚被回复过的人在该窗口内（默认 120 秒，可配 0 关闭）继续
+  发言也会接着回复，支持连续对话。
+- 配置持久化在 `%APPDATA%\wechat-mcp\bot.json`（可用 `WECHAT_BOT_CONFIG` 覆盖）。
+
+### 修复
+
+- 修复「B 被 @ 后回答的是更早 A 的话题」：触发消息在上下文中标记为
+  `[待回复]`，并固定一条中性的行为约束，明确只回答该条消息。
+- 上下文条数默认 10 → 20、最大回复 tokens 默认 100 → 300（原值会让回复被截断）。
+- 行为约束中要求纯文本回复、禁用 Markdown 标记（微信不渲染）。
+
+### 变更
+
+- `MessageRecord` 新增 `is_at_me` / `reply_to_name` 并由适配层透传；
+  适配层新增实时消息订阅（`add_message_listener`）与 `self_names()`。
+- 入库 `wechat_bridge.py` 增加最小增量：`WeChatMessage.reply_to_name` 与
+  `WeChatBridge._extract_reply_target`（解析引用消息的被引用者显示名）。
+- 会话识别改为以会话 ID 为稳定标识：`MessageRecord` 新增 `chat_id`；
+  发送前把退化成 ID 的显示名按 username 反查为可搜索名，解析不到则拒绝发送
+  （不再把 `xxx@chatroom` 当关键词搜进微信搜索框）；群范围同时接受群名与会话 ID。
+- 打包入口支持双模式：默认 stdio（DSH 兼容）、`--gui` 桌面窗口；
+  onedir 约 75 MB / zip 约 35 MB。
+
+### 说明
+
+- 自动回复仅在程序运行期间有效；已验证冻结 GUI 真实触发 DeepSeek API（200）
+  并回复，stdio 模式仍枚举 9 个工具。93 项单元测试全部通过。
+
 ## [0.3.0] - 2026-10-04
 
 阶段 5：打包分发（独立运行时 + DeepSeek Harness 插件）。

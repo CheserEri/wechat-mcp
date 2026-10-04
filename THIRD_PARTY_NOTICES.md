@@ -13,7 +13,7 @@
 | 来源项目 | `deepseekgirl`（原项目仓库：<https://github.com/linxisama/deepseekgirl>） |
 | 来源路径 | 本地目录 `F:\Code\deepseekgirl-main` 下的 `src/wechat_bridge.py` |
 | 用途 | 复用其 `WeChatBridge`（基于 wxauto / UI Automation 的微信桌面桥接），供源码模式与 PyInstaller 冻结打包内置 |
-| 修改情况 | 除文件顶部的来源声明注释块外，内容未做任何修改 |
+| 修改情况 | 除文件顶部来源声明外，另有 wechat-mcp 为「引用/回复消息」检测所做的最小增量：`WeChatMessage.reply_to_name` 字段与 `WeChatBridge._extract_reply_target` 解析（仅新增，不改变原有行为） |
 
 > **授权状态：上游项目未声明任何开源许可证。**
 > 上游项目根目录不存在 `LICENSE` 文件，亦未在其文档中声明授权条款。

@@ -52,6 +52,14 @@
 
 该包已内置微信桥接模块，**不依赖 `DEEPSEEKGIRL_PATH`**。
 
+**桌面版（实时自动回复助手）**：同一个 exe 加 `--gui` 参数启动原生窗口，
+无需 Agent 轮询：消息到达即处理，群里有人 @我 / 引用回复我（私聊每条）时，
+取最近 N 条上下文 + 人设发给大模型并自动回复；人设、模型、群范围均可在界面修改。
+
+```powershell
+.\wechat-mcp.exe --gui
+```
+
 ### 方式二：DeepSeek Harness 插件（输入名称即安装）
 
 ```sh
@@ -74,6 +82,12 @@ python -m venv .venv
 `[wechat]` 会安装微信自动化所需的运行时依赖（`wechatauto-replica`、`wxauto4`、
 `uiautomation`、`loguru`）。源码模式下适配层从 `DEEPSEEKGIRL_PATH` 指定的项目复用
 `WeChatBridge`；冻结打包时会自动内置该模块。
+
+桌面窗口（界面 API Key 在界面中填写，无需环境变量）：
+
+```powershell
+.venv\Scripts\python.exe -m wechat_mcp.desktop
+```
 
 ## 配置
 

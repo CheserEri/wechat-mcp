@@ -13,7 +13,9 @@
 # 但标注来源并不等同于获得授权；如进行再分发，请自行确认上游授权情况。
 # 详见仓库根目录 THIRD_PARTY_NOTICES.md。
 #
-# 除本声明注释块外，本文件内容未做任何修改。
+# 除本声明注释块，以及为支持「引用/回复消息」检测而做的最小增量
+# （WeChatMessage.reply_to_name 字段、WeChatBridge._extract_reply_target 解析及
+# 构造处的一次调用，均为新增、不改变任何原有行为）外，本文件未做其他修改。
 # =============================================================================
 
 """微信桥接模块：通过 wxauto (UI Automation) 连接微信桌面客户端"""
@@ -539,6 +541,8 @@ class WeChatMessage:
     voice_url: str = ""         # 远端语音附件地址（QQ）
     voice_mime: str = ""        # 语音附件 MIME
     voice_filename: str = ""    # 远端语音附件文件名
+    # wechat-mcp 为「引用/回复消息」检测新增：被引用者显示名，非引用消息为空。
+    reply_to_name: str = ""
 
 
 def _control_bounds(control) -> tuple[int, int, int, int] | None:
@@ -1321,6 +1325,9 @@ class WeChatBridge:
             if message_type == "voice":
                 voice_path = self._extract_voice_file(msg, chat_id)
 
+            # wechat-mcp 新增：解析引用/回复的目标显示名。
+            reply_to_name = self._extract_reply_target(raw_content)
+
             # 同一实例/多实例重复投递的消息只处理一次
             if message_id and self._is_duplicate_delivery(message_id):
                 logger.debug(f"重复投递的消息已忽略: {message_id}")
@@ -1346,6 +1353,7 @@ class WeChatBridge:
                 is_self=is_self,
                 poke_sender=poke_sender,
                 voice_path=voice_path,
+                reply_to_name=reply_to_name,
             )
 
             scope = "群聊" if is_group else "私聊"
@@ -1611,6 +1619,25 @@ class WeChatBridge:
             return "[卡片消息]"
 
         return text.strip()
+
+    @staticmethod
+    def _extract_reply_target(raw_content: str) -> str:
+        """引用/回复消息：返回被引用者的显示名；非引用或解析不到时返回空串。
+
+        wechat-mcp 新增。微信引用消息（appmsg）原始内容里含 ``<refermsg>``，
+        其 ``<displayname>`` 为被引用者显示名，用于判断是否在回复本机器人。
+        本方法只读取，不改变任何原有逻辑。
+        """
+        if not raw_content or "<refermsg>" not in raw_content:
+            return ""
+        match = re.search(
+            r"<refermsg>.*?<displayname>\s*(.*?)\s*</displayname>",
+            raw_content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        return html.unescape(match.group(1)).strip()[:100]
 
     def _is_at_me(self, msg, content: str) -> bool:
         """判断消息是否明确 @ 当前机器人。"""

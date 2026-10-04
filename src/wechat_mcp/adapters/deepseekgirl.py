@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
+import logging
+import re
 import sys
 import threading
 from collections import deque
@@ -61,6 +63,28 @@ _STATUS_MAP: dict[str, ConnectionState] = {
     "connected": ConnectionState.CONNECTED,
     "error": ConnectionState.ERROR,
 }
+
+_listener_logger = logging.getLogger(__name__)
+
+# 微信搜索框不认会话 ID（wxid / 群 room id），把它们当关键词会打开错误会话。
+_CHAT_ID_RE = re.compile(r"^(?:wxid_[A-Za-z0-9_-]+|gh_[A-Za-z0-9_-]+|.+@chatroom)$")
+
+
+def _looks_like_chat_id(value: str) -> bool:
+    """判断字符串是否为不可直接搜索的会话 ID。"""
+    return bool(_CHAT_ID_RE.match(str(value or "").strip()))
+
+
+def _unresolved_target_error(recipient: str) -> dict[str, Any]:
+    """会话 ID 无法解析成显示名时的结构化错误。"""
+    return {
+        "code": "chat_id_unresolved",
+        "message": (
+            f"无法把会话 ID「{recipient}」解析成可搜索的会话名，已拒绝发送，"
+            "避免误搜/误发到其它会话"
+        ),
+        "detail": {"recipient": recipient},
+    }
 
 
 def _bundled_bridge_file() -> Path | None:
@@ -146,6 +170,14 @@ class DeepSeekGirlAdapter:
         self._monitor = MonitoredChats.from_config(self._config)
         # P1：消息序号，用于 get_recent_messages 的增量游标。
         self._seq = 0
+        # 实时消息订阅者：消息到达瞬间被通知（用于常驻 bot，无需轮询）。
+        # 支持同步或异步回调，入参为 MessageRecord。
+        self._message_listeners: list[
+            Callable[[MessageRecord], Any]
+        ] = []
+        # 会话 ID → 曾成功解析出的显示名。DB 快照偶发不可用时用它兜底，
+        # 避免发送时只剩「退化成 ID」的显示名可用。
+        self._chat_id_names: dict[str, str] = {}
 
     # ------------------------------------------------------------------ 生命周期
 
@@ -315,7 +347,18 @@ class DeepSeekGirlAdapter:
                 ok=False, status=SendStatus.FAILED, recipient=recipient, error=error
             )
 
-        resolved, candidates = resolve_target(recipient, self._known_chat_names())
+        # 会话身份优先用显示名；若上游解析失败退化成了会话 ID，
+        # 必须先反查成可搜索的显示名，绝不能把 ID 当关键词送进微信搜索框。
+        target = self.resolve_chat_identifier(recipient)
+        if not target:
+            return SendResult(
+                ok=False,
+                status=SendStatus.FAILED,
+                recipient=recipient,
+                error=_unresolved_target_error(recipient),
+            )
+
+        resolved, candidates = resolve_target(target, self._known_chat_names())
         if candidates:
             error = TargetAmbiguousError(
                 "目标不唯一，请指定更完整的名称：" + "、".join(candidates),
@@ -807,22 +850,83 @@ class DeepSeekGirlAdapter:
         record = self._to_record(message)
         if record is None:
             return
+        if record.chat_id and record.chat and record.chat != record.chat_id:
+            # 这条消息的显示名解析成功过，记下来供发送时兜底。
+            self._chat_id_names[record.chat_id] = record.chat
         with self._buffer_lock:
             self._seq += 1
             record.seq = self._seq
             self._buffer.append(record)
+        # 在锁外通知订阅者，避免慢回调拖住缓冲写入。
+        for listener in tuple(self._message_listeners):
+            try:
+                result = listener(record)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                _listener_logger.exception("消息订阅回调执行失败")
+
+    def add_message_listener(
+        self, listener: Callable[[MessageRecord], Any]
+    ) -> None:
+        """订阅实时消息；每条入站消息到达时被调用一次（同步或异步回调）。"""
+        if listener not in self._message_listeners:
+            self._message_listeners.append(listener)
+
+    def remove_message_listener(
+        self, listener: Callable[[MessageRecord], Any]
+    ) -> None:
+        """退订实时消息。"""
+        if listener in self._message_listeners:
+            self._message_listeners.remove(listener)
+
+    def self_names(self) -> set[str]:
+        """当前登录账号用于识别 @/引用的昵称集合（上游记录的 bot 昵称）。"""
+        bridge = self._bridge
+        names = getattr(bridge, "_bot_names", None) if bridge else None
+        return {str(name) for name in names} if names else set()
+
+    def resolve_chat_identifier(self, identifier: str) -> str:
+        """把会话 ID（``xxx@chatroom`` / ``wxid_xxx``）解析成可搜索的显示名。
+
+        微信搜索框不认会话 ID，直接把 ID 当关键词会打开错误会话；因此发送前
+        必须先经 contact.db 按 username 精确反查 ``remark`` / ``nick_name``。
+        解析不到时返回空串，调用方应拒绝发送而不是拿 ID 去搜索。
+        非 ID 形态（普通显示名）原样返回。
+        """
+        value = str(identifier or "").strip()
+        if not value or not _looks_like_chat_id(value):
+            return value
+        cached = self._chat_id_names.get(value)
+        if cached:
+            return cached
+        db = self._contact_db()
+        if db is None:
+            return ""
+        try:
+            rows = db.search_contact(value) or []
+        except Exception:
+            _listener_logger.debug("会话 ID 反查失败: %s", value, exc_info=True)
+            return ""
+        for row in rows:
+            if str(row.get("username") or "").strip() != value:
+                continue
+            name = str(row.get("remark") or row.get("nick_name") or "").strip()
+            if name and name != value:
+                return name
+        return ""
 
     @staticmethod
     def _to_record(message: Any) -> MessageRecord | None:
+        chat_id = str(getattr(message, "room_id", "") or "").strip()
         chat = str(
-            getattr(message, "room_name", "")
-            or getattr(message, "room_id", "")
-            or ""
+            getattr(message, "room_name", "") or chat_id or ""
         ).strip()
         if not chat:
             return None
         return MessageRecord(
             chat=chat,
+            chat_id=chat_id,
             sender=str(
                 getattr(message, "sender_name", "")
                 or getattr(message, "sender", "")
@@ -833,6 +937,8 @@ class DeepSeekGirlAdapter:
             is_group=bool(getattr(message, "is_group", False)),
             timestamp=float(getattr(message, "timestamp", 0.0) or 0.0),
             message_id=str(getattr(message, "id", "") or ""),
+            is_at_me=bool(getattr(message, "is_at_me", False)),
+            reply_to_name=str(getattr(message, "reply_to_name", "") or ""),
         )
 
     def _snapshot(self) -> list[MessageRecord]:

@@ -18,13 +18,19 @@ from PyInstaller.utils.hooks import collect_all
 SPEC_DIR = Path(SPECPATH).resolve()
 ROOT = SPEC_DIR.parent
 BRIDGE = SPEC_DIR / "wechat_bridge.py"
+WEBUI = ROOT / "src" / "wechat_mcp" / "webui"
 
 if not BRIDGE.is_file():
     raise SystemExit(
         "缺少 packaging/wechat_bridge.py；该文件应随仓库一同提供。"
     )
+if not WEBUI.is_dir():
+    raise SystemExit("缺少 src/wechat_mcp/webui 前端目录。")
 
-datas = [(str(BRIDGE), ".")]
+datas = [
+    (str(BRIDGE), "."),
+    (str(WEBUI), "webui"),
+]
 binaries = []
 hiddenimports = [
     # wechat_bridge 在运行期才被加载，需显式声明其依赖，否则冻结后报 ModuleNotFoundError。
@@ -38,9 +44,21 @@ hiddenimports = [
     "win32con",
     "win32process",
     "psutil",
+    # 桌面 GUI（--gui 模式）
+    "bottle",
+    "webview",
+    "webview.platforms.edgechromium",
 ]
 
-for _pkg in ("wechatauto", "wxauto4", "uiautomation", "comtypes"):
+for _pkg in (
+    "wechatauto",
+    "wxauto4",
+    "uiautomation",
+    "comtypes",
+    # pywebview（含其 js 资源）与 pythonnet（clr，含 Python.Runtime 二进制）
+    "webview",
+    "clr",
+):
     _datas, _binaries, _hidden = collect_all(_pkg)
     datas += _datas
     binaries += _binaries
