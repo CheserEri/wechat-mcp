@@ -471,6 +471,75 @@ def _circle(img: Image.Image, size: int) -> Image.Image:
     return out
 
 
+def _fit_cover(img: Image.Image, width: int, height: int) -> Image.Image:
+    """等比缩放到**完全覆盖** ``width×height``，再居中裁掉溢出部分。
+
+    多图网格里每格尺寸固定，若直接 ``resize`` 到格子大小，竖图会被横向拉宽、
+    横图会被压扁（这就是多图推文「变形」的原因）。这里先按较大的一边缩放
+    （``max`` 保证两个方向都不小于目标），再居中裁切，宽高比始终不变。
+    单图时若目标框与原图同比例，裁切量自然为 0。
+    """
+    width = max(1, int(width))
+    height = max(1, int(height))
+    src_w, src_h = max(1, img.width), max(1, img.height)
+    scale = max(width / src_w, height / src_h)
+    new_w = max(width, int(round(src_w * scale)))
+    new_h = max(height, int(round(src_h * scale)))
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - width) // 2
+    top = (new_h - height) // 2
+    return resized.crop((left, top, left + width, top + height))
+
+
+# 多图网格：两列，列间距 8px，每格高 = 格宽 × 0.62（接近 X 的 16:10 观感）。
+_MEDIA_GAP = 8
+_MEDIA_CELL_RATIO = 0.62
+
+
+def _media_boxes(
+    media: list[tuple[Image.Image, bool]], inner: int
+) -> list[tuple[Image.Image, tuple[int, int, int, int], bool]]:
+    """算每张配图的落位框 ``(图, (left, top, width, height), 是否视频封面)``。
+
+    单图：按原图比例铺满可用宽度；竖图过高时**限高并同步收窄**宽度——若只截高度
+    不缩宽度，图会被横向压扁。
+    多图：两列网格，每格尺寸一致；格内的比例由绘制时的 ``_fit_cover`` 覆盖裁切
+    保证，绝不拉伸原图。
+    """
+    boxes: list[tuple[Image.Image, tuple[int, int, int, int], bool]] = []
+    if not media:
+        return boxes
+    if len(media) == 1:
+        img, play = media[0]
+        ratio = max(1, img.width) / max(1, img.height)
+        width = inner
+        height = int(round(width / ratio))
+        if height > _MAX_MEDIA_HEIGHT:
+            height = _MAX_MEDIA_HEIGHT
+            width = max(1, int(round(height * ratio)))
+        boxes.append((img, (_PAD, 0, width, height), play))
+        return boxes
+
+    cols = 2
+    cell_w = (inner - _MEDIA_GAP) // 2
+    cell_h = int(cell_w * _MEDIA_CELL_RATIO)
+    for index, (img, play) in enumerate(media):
+        row, col = divmod(index, cols)
+        boxes.append(
+            (
+                img,
+                (
+                    _PAD + col * (cell_w + _MEDIA_GAP),
+                    row * (cell_h + _MEDIA_GAP),
+                    cell_w,
+                    cell_h,
+                ),
+                play,
+            )
+        )
+    return boxes
+
+
 def _load_image(url: str, timeout: float) -> Image.Image | None:
     try:
         raw = _get(url, timeout)
@@ -554,33 +623,7 @@ def render_card(
         img = _load_image(url, timeout)
         if img is not None:
             media.append((img, bool(tweet.video_poster) and url == tweet.video_poster))
-    media_boxes: list[tuple[Image.Image, tuple[int, int, int, int], bool]] = []
-    if media:
-        gap = 8
-        if len(media) == 1:
-            img, play = media[0]
-            w = inner
-            h = min(int(w * img.height / max(1, img.width)), _MAX_MEDIA_HEIGHT)
-            media_boxes.append((img, (_PAD, 0, w, h), play))
-        else:
-            cols = 2
-            rows = (len(media) + cols - 1) // cols
-            cell_w = (inner - gap) // 2
-            cell_h = int(cell_w * 0.62)
-            for index, (img, play) in enumerate(media):
-                row, col = divmod(index, cols)
-                media_boxes.append(
-                    (
-                        img,
-                        (
-                            _PAD + col * (cell_w + gap),
-                            row * (cell_h + gap),
-                            cell_w,
-                            cell_h,
-                        ),
-                        play,
-                    )
-                )
+    media_boxes = _media_boxes(media, inner)
     media_height = 0
     if media_boxes:
         media_height = max(top + height for _, (_, top, _, height), _ in media_boxes)
@@ -638,9 +681,9 @@ def render_card(
         _draw_glyphs(draw, text_x, y, line, body_fonts, (15, 20, 25))
         y += max(body_fonts[key].getbbox(ch)[3] for ch, key in line) + _LINE_GAP
 
-    # 配图（圆角；视频封面加播放角标）
+    # 配图（等比覆盖裁切，绝不拉伸；圆角；视频封面加播放角标）
     for img, (left, top, width, height_), play in media_boxes:
-        box = img.resize((width, height_), Image.LANCZOS)
+        box = _fit_cover(img, width, height_)
         mask = _rounded_mask((width, height_), _MEDIA_RADIUS)
         card.paste(box, (left, int(media_top) + top), mask)
         if play:

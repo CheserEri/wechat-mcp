@@ -27,7 +27,7 @@ from typing import Any, Callable
 from ..adapters.deepseekgirl import DeepSeekGirlAdapter
 from ..schemas import MessageRecord
 from .config import BotConfig
-from . import tweet
+from . import storage, tweet
 from .links import LinkResolver, extract_urls, format_link_block
 from .llm import LLMClient, LLMError
 from .persona import get_persona
@@ -717,11 +717,42 @@ class BotEngine:
             return
         outdir = self._config.download_dir()
         self._ensure_download_dir_allowed(outdir)
-        for url in urls:
-            if tweet.is_tweet_url(url):
-                await self._send_tweet(record, url, outdir)
-            else:
-                await self._download_and_send_one(record, url, outdir)
+        try:
+            for url in urls:
+                if tweet.is_tweet_url(url):
+                    await self._send_tweet(record, url, outdir)
+                else:
+                    await self._download_and_send_one(record, url, outdir)
+        finally:
+            # 无论成功与否都收尾：下载目录长期累积会吃满磁盘。
+            await self._enforce_download_quota(outdir)
+
+    async def _enforce_download_quota(self, outdir: Path) -> None:
+        """下载目录总占用超过配置上限时，删除最旧的文件直到降到上限以内。
+
+        配置为 0 表示不限制，直接跳过。清理走线程池（要遍历目录），失败只记日志，
+        不影响已经完成的下载回发。
+        """
+        quota = self._config.download_quota_bytes()
+        if quota <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            removed = await loop.run_in_executor(
+                None,
+                lambda: storage.enforce_quota(outdir, quota, logger=self._log),
+            )
+        except Exception as exc:  # 清理是收尾动作，异常不该影响主流程
+            self._log("warning", f"下载目录清理异常：{exc}")
+            return
+        if removed:
+            freed = storage.total_size(removed) / (1024 * 1024)
+            limit_mb = self._config.link_download_quota_mb
+            self._log(
+                "info",
+                f"下载目录超过 {limit_mb} MB，已清理 {len(removed)} 个旧文件"
+                f"（释放 {freed:.1f} MB）。",
+            )
 
     async def _send_tweet(self, record: MessageRecord, url: str, outdir: Path) -> None:
         """X 推文：发卡片图（可选）；含视频则再下载视频回发。"""

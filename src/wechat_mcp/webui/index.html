@@ -295,6 +295,11 @@
             <label>下载目录（留空用默认）</label>
             <input type="text" data-key="link_download_dir" placeholder="留空：%APPDATA%\wechat-mcp\downloads"/>
           </div>
+          <div class="field">
+            <label>目录占用上限（MB，0=不限）</label>
+            <input type="number" min="0" max="102400" data-key="link_download_quota_mb"/>
+          </div>
+          <p class="hint">下载目录<b>总占用</b>超过上限时，每次下载完成后自动删除<b>最旧</b>的文件，直到降到上限以内（正在下载/发送的文件不会被删）。默认 1024 MB（1 GB）；填 0 表示不限制。</p>
         </div>
         <div class="card">
           <div class="card-label">X（Twitter）推文卡片</div>

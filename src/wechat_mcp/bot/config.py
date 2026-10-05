@@ -119,6 +119,9 @@ class BotConfig:
     link_download_dir: str = ""
     # 单文件体积上限（MB），超过则跳过下载（0 = 不限制）。
     link_download_max_mb: int = 100
+    # 下载目录**总占用**上限（MB）：超出后自动删除最旧的文件，直到降到上限以内。
+    # 0 = 不限制。默认 1 GB——长期运行不至于把磁盘吃满，正常使用也很少触发。
+    link_download_quota_mb: int = 1024
     # X（Twitter）推文额外发一张本地渲染的卡片图（头像/昵称/正文/配图）。
     # 仅对 X 推文生效；推文含视频时还会下载视频一并回发。
     link_tweet_card_enabled: bool = True
@@ -202,6 +205,7 @@ class BotConfig:
         config.link_download_max = max(0, int(config.link_download_max))
         config.link_download_dir = str(config.link_download_dir or "").strip()
         config.link_download_max_mb = max(0, int(config.link_download_max_mb))
+        config.link_download_quota_mb = max(0, int(config.link_download_quota_mb))
         config.link_tweet_card_enabled = bool(config.link_tweet_card_enabled)
         config.link_ack_enabled = bool(config.link_ack_enabled)
         # 文案留空即视为「不发提示」，故不做默认值回填（只去空白与换行）。
@@ -215,6 +219,10 @@ class BotConfig:
         if raw:
             return Path(raw).expanduser()
         return default_config_path().parent / "downloads"
+
+    def download_quota_bytes(self) -> int:
+        """下载目录总占用上限（字节）；0 表示不限制。"""
+        return max(0, int(self.link_download_quota_mb)) * 1024 * 1024
 
     def save(self, path: Path | None = None) -> Path:
         target = path or default_config_path()

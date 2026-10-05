@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import time
 import unittest
@@ -1647,6 +1648,95 @@ class TweetTests(unittest.TestCase):
             self.assertTrue(Path(path).is_file())
             self.assertGreater(Path(path).stat().st_size, 1000)
 
+    @staticmethod
+    def _striped(width: int, height: int):
+        """横向三等分色条（红/绿/蓝），用来判断是「裁切」还是「拉伸」。"""
+        from PIL import Image
+
+        img = Image.new("RGB", (width, height), (0, 0, 0))
+        pixels = img.load()
+        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+        for x in range(width):
+            color = colors[min(2, x * 3 // width)]
+            for y in range(height):
+                pixels[x, y] = color
+        return img
+
+    def test_fit_cover_crops_instead_of_stretching(self):
+        """等比覆盖裁切：300×100 塞进 100×100 应只剩中间那一条，而不是压扁三色。"""
+        from wechat_mcp.bot import tweet as tweet_mod
+
+        out = tweet_mod._fit_cover(self._striped(300, 100), 100, 100)
+        self.assertEqual(out.size, (100, 100))
+        for x in (0, 50, 99):
+            self.assertEqual(out.getpixel((x, 50)), (0, 255, 0))
+        # 对照：直接 resize（旧行为）会把三条都挤进来 —— 那正是「变形」。
+        squeezed = self._striped(300, 100).resize((100, 100))
+        self.assertEqual(squeezed.getpixel((5, 50)), (255, 0, 0))
+        self.assertEqual(squeezed.getpixel((95, 50)), (0, 0, 255))
+
+    def test_media_boxes_single_keeps_aspect_ratio(self):
+        from wechat_mcp.bot import tweet as tweet_mod
+        from PIL import Image
+
+        inner = tweet_mod.CARD_WIDTH - tweet_mod._PAD * 2
+        wide = Image.new("RGB", (1000, 500))
+        box = tweet_mod._media_boxes([(wide, False)], inner)[0][1]
+        self.assertEqual(box[2:], (inner, inner // 2))
+
+        # 竖图限高时必须同步收窄，否则会被横向压扁。
+        tall = Image.new("RGB", (500, 1000))
+        box = tweet_mod._media_boxes([(tall, False)], inner)[0][1]
+        self.assertEqual(box[3], tweet_mod._MAX_MEDIA_HEIGHT)
+        self.assertAlmostEqual(box[2] / box[3], 0.5, places=2)
+
+    def test_media_boxes_multi_grid_is_uniform_and_inside_card(self):
+        from wechat_mcp.bot import tweet as tweet_mod
+        from PIL import Image
+
+        inner = tweet_mod.CARD_WIDTH - tweet_mod._PAD * 2
+        media = [(Image.new("RGB", (w, h)), i == 2) for i, (w, h) in enumerate(
+            [(1600, 900), (600, 1200), (800, 800), (1200, 400)]
+        )]
+        boxes = tweet_mod._media_boxes(media, inner)
+        self.assertEqual(len(boxes), 4)
+        sizes = {box[2:] for _img, box, _play in boxes}
+        self.assertEqual(len(sizes), 1, "多图网格每格尺寸必须一致")
+        for _img, (left, top, width, height), _play in boxes:
+            self.assertGreater(width, 0)
+            self.assertGreater(height, 0)
+            self.assertLessEqual(left + width, tweet_mod.CARD_WIDTH)
+        # 播放角标只落在视频封面那一格上。
+        self.assertEqual([play for _img, _box, play in boxes], [False, False, True, False])
+
+    def test_render_card_with_multiple_photos(self):
+        """多图推文：横竖混排也要出图且不报错（回归「多图变形」）。"""
+        from wechat_mcp.bot import tweet as tweet_mod
+        from PIL import Image
+
+        info = tweet_mod.Tweet(
+            id="42",
+            url="https://x.com/a/status/42",
+            text="多图测试",
+            author_name="某人",
+            author_handle="someone",
+            photos=["https://p/1.jpg", "https://p/2.jpg", "https://p/3.jpg"],
+        )
+        shapes = [(1600, 900), (600, 1200), (900, 900)]
+        original = tweet_mod._load_image
+        tweet_mod._load_image = lambda url, timeout: Image.new(
+            "RGB", shapes[int(url.rsplit("/", 1)[1].split(".")[0]) - 1]
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = tweet_mod.render_card(info, tmp, timeout=5)
+                self.assertIsNotNone(path)
+                self.assertTrue(Path(path).is_file())
+                with Image.open(path) as card:
+                    self.assertEqual(card.size[0], tweet_mod.CARD_WIDTH)
+        finally:
+            tweet_mod._load_image = original
+
 
 class TweetEngineTests(unittest.IsolatedAsyncioTestCase):
     """引擎：推文链接发卡片图；含视频时再下载视频回发。"""
@@ -1946,6 +2036,9 @@ class LinkConfigTests(unittest.TestCase):
         self.assertFalse(cfg.link_download_enabled)
         self.assertEqual(cfg.link_download_max, 1)
         self.assertEqual(cfg.link_download_max_mb, 100)
+        # 下载目录总占用默认 1 GB，超限自动清理最旧文件。
+        self.assertEqual(cfg.link_download_quota_mb, 1024)
+        self.assertEqual(cfg.download_quota_bytes(), 1024 * 1024 * 1024)
         self.assertTrue(cfg.link_tweet_card_enabled)
         # 识别到链接就回固定提示；默认不改变原有的模型回复行为。
         self.assertTrue(cfg.link_ack_enabled)
@@ -1964,6 +2057,7 @@ class LinkConfigTests(unittest.TestCase):
                 "link_parse_timeout": 0,
                 "link_download_max": -1,
                 "link_download_max_mb": -5,
+                "link_download_quota_mb": -7,
                 "link_download_dir": "   ",
             }
         )
@@ -1971,6 +2065,9 @@ class LinkConfigTests(unittest.TestCase):
         self.assertEqual(cfg.link_parse_timeout, 1.0)
         self.assertEqual(cfg.link_download_max, 0)
         self.assertEqual(cfg.link_download_max_mb, 0)
+        # 0 表示「不限制」，负数一律归零而不是回落到默认值。
+        self.assertEqual(cfg.link_download_quota_mb, 0)
+        self.assertEqual(cfg.download_quota_bytes(), 0)
         self.assertEqual(cfg.link_download_dir, "")
 
     def test_download_dir_default_and_override(self):
@@ -2205,6 +2302,130 @@ class LinkDownloadTests(unittest.TestCase):
                 )
         finally:
             links_mod.load_yt_dlp = original
+
+
+class StorageQuotaTests(unittest.TestCase):
+    """下载目录占用统计与「最旧优先」自动清理。"""
+
+    @staticmethod
+    def _touch(directory, name, size, mtime):
+        path = Path(directory) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * size)
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def test_dir_usage_and_total_size(self):
+        from wechat_mcp.bot import storage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(storage.dir_usage(tmp), 0)
+            self.assertEqual(storage.dir_usage(Path(tmp) / "不存在"), 0)
+            self._touch(tmp, "a.bin", 100, 1000)
+            self._touch(tmp, "sub/b.bin", 250, 1000)
+            self.assertEqual(storage.dir_usage(tmp), 350)
+            self.assertEqual(storage.total_size([Path(tmp) / "a.bin"]), 100)
+            self.assertEqual(storage.total_size([Path(tmp) / "缺.bin"]), 0)
+
+    def test_enforce_quota_removes_oldest_first(self):
+        from wechat_mcp.bot import storage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            oldest = self._touch(tmp, "old.bin", 400, 1000)
+            middle = self._touch(tmp, "mid.bin", 400, 2000)
+            newest = self._touch(tmp, "new.bin", 400, 3000)
+            # 总量 1200 > 900 → 只删最旧的一个（400）后正好 800 ≤ 900。
+            removed = storage.enforce_quota(tmp, 900)
+            self.assertEqual(removed, [oldest])
+            self.assertFalse(oldest.exists())
+            self.assertTrue(middle.exists() and newest.exists())
+            self.assertEqual(storage.dir_usage(tmp), 800)
+
+    def test_enforce_quota_noop_when_within_limit_or_disabled(self):
+        from wechat_mcp.bot import storage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            keep = self._touch(tmp, "a.bin", 100, 1000)
+            self.assertEqual(storage.enforce_quota(tmp, 100), [])
+            self.assertEqual(storage.enforce_quota(tmp, 0), [])  # 0 = 不限制
+            self.assertEqual(storage.enforce_quota(tmp, -1), [])
+            self.assertTrue(keep.exists())
+
+    def test_enforce_quota_never_deletes_protected_files(self):
+        from wechat_mcp.bot import storage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._touch(tmp, "old.bin", 400, 1000)
+            sending = self._touch(tmp, "sending.bin", 400, 2000)
+            # 配额为 0 字节：除保护项外全删，保护项必须留下。
+            removed = storage.enforce_quota(tmp, 1, protect=[sending])
+            self.assertEqual(removed, [old])
+            self.assertTrue(sending.exists())
+            self.assertEqual(storage.dir_usage(tmp), 400)
+
+    def test_enforce_quota_handles_missing_directory(self):
+        from wechat_mcp.bot import storage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(storage.enforce_quota(Path(tmp) / "缺", 10), [])
+
+
+class DownloadQuotaEngineTests(unittest.IsolatedAsyncioTestCase):
+    """引擎：下载回发完成后按配置上限清理下载目录。"""
+
+    def _engine(self, **cfg_kwargs):
+        cfg = BotConfig(
+            enabled=True, cooldown_seconds=0.0, reply_probability=1.0, **cfg_kwargs
+        )
+        return BotEngine(FakeAdapter(), cfg, llm_factory=lambda c: FakeLLM(c))
+
+    async def test_download_trims_oldest_file_when_over_quota(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old.mp4"
+            old.write_bytes(b"x" * (2 * 1024 * 1024))
+            os.utime(old, (1, 1))  # 很旧 → 应被清理
+
+            engine = self._engine(
+                link_download_enabled=True,
+                link_download_dir=tmp,
+                link_download_quota_mb=1,
+            )
+
+            async def _fake_download(url, outdir, max_mb=0):
+                fresh = Path(outdir) / "new.mp4"
+                fresh.write_bytes(b"y" * 1024)
+                return str(fresh)
+
+            engine._links.download = _fake_download
+            await engine._download_and_send(
+                make_record(content="https://example.com/video")
+            )
+
+            self.assertFalse(old.exists(), "超出配额时应删掉最旧的下载")
+            self.assertTrue((Path(tmp) / "new.mp4").is_file(), "最新的文件应保留")
+            messages = [line["message"] for line in engine.get_logs(0)]
+            self.assertTrue(any("已清理 1 个旧文件" in m for m in messages), messages)
+
+    async def test_download_keeps_files_when_quota_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old.mp4"
+            old.write_bytes(b"x" * (2 * 1024 * 1024))
+            engine = self._engine(
+                link_download_enabled=True,
+                link_download_dir=tmp,
+                link_download_quota_mb=0,
+            )
+
+            async def _fake_download(url, outdir, max_mb=0):
+                fresh = Path(outdir) / "new.mp4"
+                fresh.write_bytes(b"y")
+                return str(fresh)
+
+            engine._links.download = _fake_download
+            await engine._download_and_send(
+                make_record(content="https://example.com/video")
+            )
+            self.assertTrue(old.exists(), "配额为 0 表示不限制，不应删除任何文件")
 
 
 if __name__ == "__main__":
