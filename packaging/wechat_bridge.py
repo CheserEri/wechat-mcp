@@ -604,6 +604,9 @@ class WeChatBridge:
     SEND_BACKOFF_MAX_SECONDS = 2.0       # 冷却最长 2 秒（减少等待）
     SEND_ITEM_TTL_SECONDS = 60.0         # 排队太久没发出去的回复直接丢弃
     MESSAGE_DEDUPE_WINDOW_SECONDS = 60.0 # 去重窗口60秒（避免重复但不过长）
+    # 机器人昵称缓存的有效期：微信里改了昵称后不必重启程序——一旦遇到「有 @ 但
+    # 没匹配上」的消息，就按这个间隔重读一次昵称（避免每条群消息都去查库）。
+    IDENTITY_REFRESH_SECONDS = 60.0
 
     # 这些账号的消息不参与私聊自动回复（公众号/系统号/文件传输助手等）
     IGNORED_PRIVATE_ACCOUNTS = {
@@ -644,6 +647,8 @@ class WeChatBridge:
         self._registered_listen_keys_by_group: dict[str, str] = {}
         self._bot_names: set[str] = set()
         self._self_wxid = ""
+        # 上次读取机器人昵称的时间（monotonic），用于「改昵称免重启」的刷新节流。
+        self._identity_loaded_at = 0.0
         self._chat_names: dict[str, str] = {}
         self._target_group_ids: set[str] = set()
         self._listen_all_active = False
@@ -968,14 +973,19 @@ class WeChatBridge:
         return backend
 
     def _load_bot_identity(self) -> None:
-        """记录当前微信昵称，用于识别群消息中的 @机器人。"""
+        """记录当前微信昵称，用于识别群消息中的 @机器人。
+
+        读不到任何名字时**保留上一次的结果**：宁可继续用旧昵称，也好过把 @ 识别
+        整个清空（清空后群里 @ 机器人就永远不会触发了）。
+        """
         names: set[str] = set()
-        nickname = getattr(self._wx, "nickname", None)
+        wx = getattr(self, "_wx", None)
+        nickname = getattr(wx, "nickname", None)
         if nickname:
             names.add(str(nickname).strip())
 
         try:
-            info = self._wx._db.get_self_info()
+            info = wx._db.get_self_info()
             self_wxid = str(info.get("username") or "").strip()
             if self_wxid:
                 self._self_wxid = self_wxid
@@ -986,9 +996,32 @@ class WeChatBridge:
         except Exception:
             pass
 
-        self._bot_names = {name for name in names if name}
-        if self._bot_names:
-            logger.info(f"已识别机器人微信昵称: {', '.join(sorted(self._bot_names))}")
+        self._identity_loaded_at = time.monotonic()
+        collected = {name for name in names if name}
+        if not collected:
+            return
+        if collected != self._bot_names:
+            logger.info(f"已识别机器人微信昵称: {', '.join(sorted(collected))}")
+        self._bot_names = collected
+
+    def _refresh_bot_identity(self) -> bool:
+        """按冷却时间重读机器人昵称；昵称发生变化时返回 ``True``。
+
+        微信昵称只在连接时读过一次，用户改了昵称就得重启程序才能生效——这里让它在
+        需要时自动跟上：``_is_at_me`` 遇到「消息里有 @ 但没匹配上任何已知昵称」时
+        调用一次，改名后最慢在下一条 @ 消息上生效。
+        """
+        now = time.monotonic()
+        if now - self._identity_loaded_at < self.IDENTITY_REFRESH_SECONDS:
+            return False
+        before = set(self._bot_names)
+        try:
+            self._load_bot_identity()
+        except Exception as exc:  # 刷新失败不应影响原本的判定结果
+            self._identity_loaded_at = now
+            logger.debug(f"刷新机器人昵称失败: {exc}")
+            return False
+        return self._bot_names != before
 
     def start_listening(self, loop: asyncio.AbstractEventLoop) -> None:
         """启动消息监听（轮询模式）"""
@@ -1730,22 +1763,31 @@ class WeChatBridge:
             return ""
         return html.unescape(match.group(1)).strip()[:100]
 
+    def _matches_bot_name(self, content: str) -> bool:
+        """消息文本里是否出现了 ``@<机器人昵称>``。"""
+        if not content:
+            return False
+        for name in self._bot_names:
+            pattern = (
+                rf"@{re.escape(name)}"
+                r"(?=$|[\s\u2000-\u200f\u2028-\u202f\u205f\u3000，,。.!！？:：])"
+            )
+            if re.search(pattern, content):
+                return True
+        return False
+
     def _is_at_me(self, msg, content: str) -> bool:
         """判断消息是否明确 @ 当前机器人。"""
         if bool(getattr(msg, "is_at", False)):
             return True
         if bool(getattr(msg, "is_at_me", False)):
             return True
-        if not self._bot_names:
-            return False
-
-        for name in self._bot_names:
-            pattern = (
-                rf"@{re.escape(name)}"
-                r"(?=$|[\s\u2000-\u200f\u2028-\u202f\u205f\u3000，,。.!！？:：])"
-            )
-            if re.search(pattern, content or ""):
-                return True
+        if self._matches_bot_name(content):
+            return True
+        # 文本里有 @ 却没匹配上：可能是用户刚在微信里改了昵称（昵称只在连接时读过
+        # 一次）。这里按冷却时间重读一次再判，省得「改个昵称必须重启程序」。
+        if "@" in (content or "") and self._refresh_bot_identity():
+            return self._matches_bot_name(content)
         return False
 
     async def send_text(self, room_name: str, content: str) -> bool:

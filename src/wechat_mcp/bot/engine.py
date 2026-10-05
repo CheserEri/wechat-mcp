@@ -327,6 +327,33 @@ class BotEngine:
             return True
         return target in names
 
+    def _explain_no_reply(self, record: MessageRecord) -> None:
+        """群消息没被触发时给一行可读原因。
+
+        「群里 @ 了机器人却不回」最常见的原因就是**@ 的名字和机器人微信昵称不一致**
+        （手打「@某某」不会产生真正的 @ 提醒，而本项目的 @ 识别就是拿消息文本里的
+        ``@昵称`` 去比对登录账号的昵称）。此前这条路径**完全不打日志**，用户只看到
+        入站消息、看不到任何解释，容易误以为程序坏了。这里把机器人**当前识别到的
+        昵称**一并打出来，照着 @ 即可。
+        """
+        if not record.is_group:
+            return
+        if not self._in_group_scope(record):
+            self._log("debug", f"群不在作用范围，已忽略 [{record.chat}]。")
+            return
+        if not self._config.trigger_at:
+            self._log(
+                "debug",
+                f"群消息未命中触发条件（「@我」触发已关闭），已忽略 [{record.chat}]。",
+            )
+            return
+        names = "、".join(sorted(self._adapter.self_names())) or "（未识别到昵称）"
+        self._log(
+            "debug",
+            f"群消息未 @ 机器人，已忽略 [{record.chat}] {record.sender}："
+            f"{record.content[:30]}｜机器人昵称：{names}",
+        )
+
     @classmethod
     def _cooldown_key(cls, record: MessageRecord) -> str:
         key = cls._chat_key(record)
@@ -345,6 +372,7 @@ class BotEngine:
         acked = await self._handle_links(record)
 
         if not self._should_reply(record):
+            self._explain_no_reply(record)
             return
 
         if acked and not self._config.link_llm_followup:

@@ -230,6 +230,38 @@ class TriggerTests(unittest.TestCase):
         engine._last_reply_to["测试群"] = ("张三", time.time() - 60)
         self.assertFalse(engine._should_reply(make_record(sender="张三")))
 
+    def test_explain_no_reply_prints_bot_nickname(self):
+        """群里没 @ 到机器人时给一行可读原因，并打出机器人当前昵称。"""
+        engine = BotEngine(FakeAdapter(names={"Viollete"}), BotConfig())
+        engine._explain_no_reply(make_record(content="@群助手 在吗"))
+        lines = [line["message"] for line in engine.get_logs(0)]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("未 @ 机器人", lines[0])
+        self.assertIn("Viollete", lines[0])
+
+    def test_explain_no_reply_reports_unknown_nickname(self):
+        engine = BotEngine(FakeAdapter(names=set()), BotConfig())
+        engine._explain_no_reply(make_record())
+        lines = [line["message"] for line in engine.get_logs(0)]
+        self.assertIn("未识别到昵称", lines[0])
+
+    def test_explain_no_reply_ignores_private_and_out_of_scope(self):
+        engine = BotEngine(
+            FakeAdapter(names={"小深"}),
+            BotConfig(all_groups=False, groups=["别的群"]),
+        )
+        engine._explain_no_reply(make_record(is_group=False, chat="朋友"))
+        engine._explain_no_reply(make_record(chat="其他群"))
+        lines = [line["message"] for line in engine.get_logs(0)]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("群不在作用范围", lines[0])
+
+    def test_explain_no_reply_when_at_trigger_off(self):
+        engine = BotEngine(FakeAdapter(names={"小深"}), BotConfig(trigger_at=False))
+        engine._explain_no_reply(make_record())
+        lines = [line["message"] for line in engine.get_logs(0)]
+        self.assertIn("触发已关闭", lines[0])
+
 
 class MessageBuildTests(unittest.TestCase):
     def test_group_prefix_and_assistant(self):
@@ -352,6 +384,21 @@ class EngineFlowTests(unittest.IsolatedAsyncioTestCase):
         # 发给模型的消息含 system（人设）
         self.assertEqual(fake_llm.last_messages[0]["role"], "system")
         await engine.stop()
+
+    async def test_untriggered_group_message_is_explained_in_log(self):
+        """端到端：群里没 @ 到机器人 → 不回复，但日志里能看到原因与机器人昵称。"""
+        adapter = FakeAdapter(names={"Viollete"})
+        cfg = BotConfig(enabled=True, cooldown_seconds=0.0, reply_probability=1.0)
+        engine = BotEngine(adapter, cfg, llm_factory=lambda c: FakeLLM(c))
+        await engine.start()
+        await adapter.dispatch(make_record(content="@群助手 在吗", message_id="m1"))
+        await adapter.pump()
+        await engine.stop()
+        self.assertEqual(adapter.sent, [])
+        lines = [line["message"] for line in engine.get_logs(0)]
+        self.assertTrue(
+            any("未 @ 机器人" in m and "Viollete" in m for m in lines), lines
+        )
 
     async def test_continuation_replies_without_at(self):
         adapter = FakeAdapter()
@@ -1087,6 +1134,134 @@ class BridgeNormalizeTests(unittest.TestCase):
         normalize = self._module().WeChatBridge.normalize_message_content
         raw = "<msg><appmsg><title>只有标题</title></appmsg></msg>"
         self.assertEqual(normalize(raw), "只有标题")
+
+
+class BridgeAtDetectionTests(unittest.TestCase):
+    """入库 wechat_bridge.py 的「@ 机器人」识别与昵称自动刷新。
+
+    背景：昵称只在连接时读一次，用户改了微信昵称就得重启程序才能生效。现在遇到
+    「消息里有 @ 但没匹配上」时会按冷却时间重读一次昵称。
+    """
+
+    @staticmethod
+    def _module():
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[1]
+        module_file = root / "packaging" / "wechat_bridge.py"
+        spec = importlib.util.spec_from_file_location(
+            "packaged_wechat_bridge_at", module_file
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _bridge(names=(), loaded_at=None):
+        """绕开 __init__ 造一个只带昵称状态的桥接对象。
+
+        ``loaded_at`` 默认取当前时间：昵称刚读过，不会触发刷新。要测「昵称已过期」
+        的场景就显式传 ``0.0``。
+        """
+        module = BridgeAtDetectionTests._module()
+        bridge = object.__new__(module.WeChatBridge)
+        bridge._bot_names = set(names)
+        bridge._self_wxid = "wxid_self"
+        bridge._identity_loaded_at = (
+            time.monotonic() if loaded_at is None else loaded_at
+        )
+        return bridge
+
+    class _Msg:
+        """没有 is_at / is_at_me 字段的消息对象（同 wechatauto 实际行为）。"""
+
+    def test_matches_bot_name(self):
+        bridge = self._bridge(names={"Viollete"})
+        self.assertTrue(bridge._is_at_me(self._Msg(), "@Viollete 在吗"))
+        self.assertTrue(bridge._is_at_me(self._Msg(), "@Viollete？"))
+        self.assertTrue(bridge._is_at_me(self._Msg(), "在吗 @Viollete"))
+        # 零宽字符（微信 @ 后常带）也要认
+        self.assertTrue(bridge._is_at_me(self._Msg(), "@Viollete\u200b在吗"))
+        self.assertFalse(bridge._is_at_me(self._Msg(), "@群助手 在吗"))
+        self.assertFalse(bridge._is_at_me(self._Msg(), "随便聊聊"))
+
+    def test_at_flag_on_message_object_is_respected(self):
+        bridge = self._bridge(names={"Viollete"})
+
+        class _Flagged:
+            is_at = True
+
+        self.assertTrue(bridge._is_at_me(_Flagged(), "任意内容"))
+
+    def test_rename_is_picked_up_without_restart(self):
+        """改完昵称后，下一条 @ 消息就能自动跟上，不必重启程序。"""
+        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+
+        def fake_load():
+            bridge._bot_names = {"群助手"}
+            bridge._identity_loaded_at = time.monotonic()
+
+        bridge._load_bot_identity = fake_load
+        self.assertTrue(bridge._is_at_me(self._Msg(), "@群助手 在吗"))
+        self.assertEqual(bridge._bot_names, {"群助手"})
+
+    def test_refresh_is_throttled(self):
+        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        calls = []
+
+        def fake_load():
+            calls.append(1)
+            bridge._identity_loaded_at = time.monotonic()
+
+        bridge._load_bot_identity = fake_load
+        # 冷却期内连续两条不匹配的消息只重读一次
+        self.assertFalse(bridge._is_at_me(self._Msg(), "@张三 在吗"))
+        self.assertFalse(bridge._is_at_me(self._Msg(), "@李四 在吗"))
+        self.assertEqual(len(calls), 1)
+
+    def test_no_refresh_without_at_sign(self):
+        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+        calls = []
+
+        def fake_load():
+            calls.append(1)
+
+        bridge._load_bot_identity = fake_load
+        self.assertFalse(bridge._is_at_me(self._Msg(), "普通群消息"))
+        self.assertEqual(calls, [])
+
+    def test_load_keeps_previous_names_when_nothing_readable(self):
+        """读不到昵称时保留旧值——清空会让群里 @ 机器人彻底失效。"""
+        module = self._module()
+        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+
+        class _FakeWx:
+            nickname = ""
+
+            class _db:
+                @staticmethod
+                def get_self_info():
+                    return {}
+
+        bridge._wx = _FakeWx()
+        bridge._load_bot_identity()
+        self.assertEqual(bridge._bot_names, {"Viollete"})
+
+    def test_load_reads_nickname_and_wxid(self):
+        bridge = self._bridge(names={"Viollete"}, loaded_at=0.0)
+
+        class _FakeWx:
+            nickname = "群助手"
+
+            class _db:
+                @staticmethod
+                def get_self_info():
+                    return {"nick_name": "群助手", "username": "wxid_new"}
+
+        bridge._wx = _FakeWx()
+        bridge._load_bot_identity()
+        self.assertEqual(bridge._bot_names, {"群助手", "wxid_new"})
+        self.assertEqual(bridge._self_wxid, "wxid_new")
 
 
 class BridgeMediaContextTests(unittest.TestCase):
