@@ -65,6 +65,24 @@
 - 文件必须位于允许目录内；使用 `..` 尝试越界会被拒绝。
 - 确认文件存在、是普通文件且可读，否则返回 `file_invalid`。
 
+## 链接解析失败 / 无法解析链接
+
+先用诊断命令确认打包版链路本身是否可用（不启动微信）：
+
+```powershell
+.\wechat-mcp.exe --selfcheck                                  # 看 yt_dlp_version / ffmpeg 是否正常
+.\wechat-mcp.exe --resolve <url> [--download] [--outdir <目录>]  # 直接跑一遍解析
+```
+
+- `--selfcheck` 里 `yt_dlp_version` 显示 `(不可用)`：内置 yt-dlp 导入失败，
+  其下方会给出 `yt_dlp_error`（冻结包缺标准库子模块的典型症状）。
+- 媒体站点（B 站 / YouTube 等）解析不出标题：确认网络可达，且该站需要登录时
+  在 `cookies` 层面另行处理；普通网页会自动回退到抓取 `<title>`。
+- **下载**音视频失败：DASH 分离流必须靠 ffmpeg 合流，`--selfcheck` 的 `ffmpeg`
+  必须可用（打包版已内置 `imageio_ffmpeg` 自带的 ffmpeg）。
+- 「下载并回发」默认关闭；开启后下载目录会被自动纳入发送白名单，否则回发会被
+  `path_not_allowed` 拒绝。
+
 ## 日志与审计
 
 - 运行日志输出到 **stderr**，不污染 stdio 协议消息。若在客户端看不到日志属正常。

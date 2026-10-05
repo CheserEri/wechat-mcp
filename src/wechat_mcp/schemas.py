@@ -75,6 +75,8 @@ class MessageRecord:
     # ``chat`` 是显示名，可能因解析失败退化成 ID；本字段始终是稳定标识，
     # 供引擎做历史分桶 / 冷却 / 群范围匹配。
     chat_id: str = ""
+    # 已提取到本地的图片文件路径；非图片消息为空串。
+    image_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(asdict(self))

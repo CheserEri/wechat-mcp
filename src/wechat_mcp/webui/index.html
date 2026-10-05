@@ -25,6 +25,18 @@
           <svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.5A8 8 0 1 1 21 12z"/></svg>
           <span>群聊设置</span>
         </button>
+        <button class="nav-item" data-page="human">
+          <svg viewBox="0 0 24 24"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 20c0-3.3 3.6-6 8-6s8 2.7 8 6"/></svg>
+          <span>拟人化</span>
+        </button>
+        <button class="nav-item" data-page="quiet">
+          <svg viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></svg>
+          <span>静默与水群</span>
+        </button>
+        <button class="nav-item" data-page="links">
+          <svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1 0l2.4-2.4a5 5 0 0 0-7.1-7.1L11.5 4.4"/><path d="M14 11a5 5 0 0 0-7.1 0L4.5 13.4a5 5 0 0 0 7.1 7.1l.9-.9"/></svg>
+          <span>链接解析</span>
+        </button>
         <button class="nav-item" data-page="model">
           <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/></svg>
           <span>模型设置</span>
@@ -116,6 +128,183 @@
         <div class="actions"><button class="btn primary" id="save-chats">保存设置</button></div>
       </section>
 
+      <!-- 拟人化 -->
+      <section class="page" id="page-human">
+        <h1 class="page-title">拟人化</h1>
+        <div class="card">
+          <label class="switch-row"><span>启用拟人化（关闭后收到消息即整段回复）</span>
+            <input type="checkbox" class="switch" data-key="humanize"/></label>
+          <p class="hint">开启后：按概率决定是否回复、较长回复拆成多条短消息发出，并让措辞更口语化。</p>
+        </div>
+
+        <div class="card form">
+          <div class="field">
+            <label>回复概率 <span class="val" id="prob-val"></span>（1 = 每条都回，越小越会「漏回」）</label>
+            <input type="range" min="0" max="1" step="0.05" data-key="reply_probability" data-val="prob-val"/>
+          </div>
+        </div>
+
+        <div class="card">
+          <label class="switch-row"><span>长回复拆成多条短消息</span>
+            <input type="checkbox" class="switch" data-key="split_replies"/></label>
+          <div class="grid-2">
+            <div class="field">
+              <label>最多拆几条</label>
+              <input type="number" min="1" max="6" data-key="split_max_parts"/>
+            </div>
+            <div class="field">
+              <label>超过多少字才拆</label>
+              <input type="number" min="0" max="500" data-key="split_min_length"/>
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label>分条间隔下限（秒）</label>
+              <input type="number" min="0" max="30" step="0.1" data-key="split_delay_min"/>
+            </div>
+            <div class="field">
+              <label>分条间隔上限（秒）</label>
+              <input type="number" min="0" max="30" step="0.1" data-key="split_delay_max"/>
+            </div>
+          </div>
+        </div>
+        <div class="actions"><button class="btn primary" id="save-human">保存设置</button></div>
+      </section>
+
+      <!-- 静默与水群 -->
+      <section class="page" id="page-quiet">
+        <h1 class="page-title">静默与水群</h1>
+
+        <div class="card">
+          <div class="card-label">静默时段</div>
+          <label class="switch-row"><span>在静默时段内不回复任何人（含 @我）</span>
+            <input type="checkbox" class="switch" data-key="quiet_hours_enabled"/></label>
+          <div class="grid-2">
+            <div class="field">
+              <label>开始时间</label>
+              <input type="time" data-key="quiet_hours_start"/>
+            </div>
+            <div class="field">
+              <label>结束时间</label>
+              <input type="time" data-key="quiet_hours_end"/>
+            </div>
+          </div>
+          <p class="hint">支持跨零点，例如 23:00 → 08:00。留空或起止相同则不生效。</p>
+        </div>
+
+        <div class="card">
+          <div class="card-label">群级节流（降低存在感）</div>
+          <label class="switch-row"><span>限制每个群的回复频率</span>
+            <input type="checkbox" class="switch" data-key="group_rate_enabled"/></label>
+          <div class="grid-2">
+            <div class="field">
+              <label>统计窗口（分钟）</label>
+              <input type="number" min="0" max="1440" data-key="group_rate_window_minutes"/>
+            </div>
+            <div class="field">
+              <label>窗口内最多回复（条）</label>
+              <input type="number" min="0" max="100" data-key="group_rate_max_replies"/>
+            </div>
+          </div>
+          <p class="hint">超出上限的群消息会被静默跳过；0 表示不限制。私聊不受此项影响。</p>
+        </div>
+
+        <div class="card">
+          <div class="card-label">偶发参与（主动水群）</div>
+          <label class="switch-row"><span>允许它偶尔主动在群里接话（默认关闭）</span>
+            <input type="checkbox" class="switch" data-key="proactive_enabled"/></label>
+          <p class="hint">开启后会往真实群聊发消息。仅当群里最近有人说话、且模型认为有话可说时才发言，否则保持安静。</p>
+          <div class="grid-2">
+            <div class="field">
+              <label>检查间隔下限（秒）</label>
+              <input type="number" min="10" max="86400" data-key="proactive_interval_min"/>
+            </div>
+            <div class="field">
+              <label>检查间隔上限（秒）</label>
+              <input type="number" min="10" max="86400" data-key="proactive_interval_max"/>
+            </div>
+          </div>
+          <div class="field">
+            <label>单次发言概率 <span class="val" id="proactive-val"></span></label>
+            <input type="range" min="0" max="1" step="0.05" data-key="proactive_probability" data-val="proactive-val"/>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label>仅最近多久有消息才考虑（秒）</label>
+              <input type="number" min="0" max="86400" data-key="proactive_recent_seconds"/>
+            </div>
+            <div class="field">
+              <label>同群两次主动发言最小间隔（秒）</label>
+              <input type="number" min="0" max="86400" data-key="proactive_per_group_cooldown"/>
+            </div>
+          </div>
+        </div>
+        <div class="actions"><button class="btn primary" id="save-quiet">保存设置</button></div>
+      </section>
+
+      <!-- 链接解析 -->
+      <section class="page" id="page-links">
+        <h1 class="page-title">链接解析</h1>
+
+        <div class="card">
+          <div class="card-label">解析链接内容</div>
+          <label class="switch-row"><span>检测到链接时自动解析并告诉模型</span>
+            <input type="checkbox" class="switch" data-key="link_parse_enabled"/></label>
+          <div class="grid-2">
+            <div class="field">
+              <label>单次最多解析（个）</label>
+              <input type="number" min="0" max="20" data-key="link_parse_max"/>
+            </div>
+            <div class="field">
+              <label>单个链接超时（秒）</label>
+              <input type="number" min="1" max="300" data-key="link_parse_timeout"/>
+            </div>
+          </div>
+          <p class="hint">内置 yt-dlp：媒体站点（YouTube / Bilibili / 抖音等）取标题、作者、时长、简介；普通网页取标题与摘要。解析结果以「[链接] …」附在该条消息之后，让机器人能就链接内容回应。</p>
+        </div>
+
+        <div class="card">
+          <div class="card-label">固定提示（不经过大模型）</div>
+          <label class="switch-row"><span>识别到链接时先回一句固定提示</span>
+            <input type="checkbox" class="switch" data-key="link_ack_enabled"/></label>
+          <div class="field">
+            <label>提示文案（留空则不发送）</label>
+            <input type="text" data-key="link_ack_text" placeholder="正在解析链接"/>
+          </div>
+          <label class="switch-row"><span>发完提示后，模型仍就这条消息接话</span>
+            <input type="checkbox" class="switch" data-key="link_llm_followup"/></label>
+          <p class="hint"><b>私聊与群聊都生效</b>：群里<b>不必 @ 机器人</b>，只要消息里有链接就会回固定提示，并把解析结果（推文卡片 / 视频 / 文件）发回当前聊天。提示语由这里写死，<b>不调用大模型</b>。关掉「模型仍接话」后，带链接的消息就只回提示与解析结果，不再烧 token。</p>
+        </div>
+
+        <div class="card">
+          <div class="card-label">下载并回发（谨慎）</div>
+          <label class="switch-row"><span>把链接里的音视频下下来发回当前聊天（默认关闭）</span>
+            <input type="checkbox" class="switch" data-key="link_download_enabled"/></label>
+          <p class="hint">开启后会向真实聊天发送文件，请谨慎。<b>任何</b>含链接的消息（私聊 / 群里不必 @ 机器人）都会下载回发，不限「触发回复」的那条。</p>
+          <div class="grid-2">
+            <div class="field">
+              <label>单次最多下载（个）</label>
+              <input type="number" min="0" max="5" data-key="link_download_max"/>
+            </div>
+            <div class="field">
+              <label>单文件上限（MB，0=不限）</label>
+              <input type="number" min="0" max="4096" data-key="link_download_max_mb"/>
+            </div>
+          </div>
+          <div class="field">
+            <label>下载目录（留空用默认）</label>
+            <input type="text" data-key="link_download_dir" placeholder="留空：%APPDATA%\wechat-mcp\downloads"/>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-label">X（Twitter）推文卡片</div>
+          <label class="switch-row"><span>推文链接额外发一张卡片图（本地渲染）</span>
+            <input type="checkbox" class="switch" data-key="link_tweet_card_enabled"/></label>
+          <p class="hint">检测到 X / Twitter 推文链接时，本地把推文渲染成一张图片（头像、昵称、认证、正文、配图）发回聊天；推文<b>含视频</b>时还会把视频下载下来一并回发。需先开启上面的「下载并回发」。</p>
+        </div>
+        <div class="actions"><button class="btn primary" id="save-links">保存设置</button></div>
+      </section>
+
       <!-- 模型设置 -->
       <section class="page" id="page-model">
         <h1 class="page-title">模型设置</h1>
@@ -135,7 +324,7 @@
           <div class="grid-2">
             <div class="field">
               <label>Temperature <span class="val" id="temp-val"></span></label>
-              <input type="range" min="0" max="2" step="0.1" data-key="temperature"/>
+              <input type="range" min="0" max="2" step="0.1" data-key="temperature" data-val="temp-val"/>
             </div>
             <div class="field">
               <label>最大回复长度（tokens）</label>
@@ -156,6 +345,17 @@
             <label>同一人冷却（秒）</label>
             <input type="number" min="0" max="60" step="0.5" data-key="cooldown_seconds"/>
           </div>
+        </div>
+
+        <div class="card">
+          <div class="card-label">图像识别</div>
+          <label class="switch-row"><span>让模型识别图片（需模型支持视觉）</span>
+            <input type="checkbox" class="switch" data-key="vision_enabled"/></label>
+          <div class="field">
+            <label>单次最多附带图片数</label>
+            <input type="number" min="0" max="10" data-key="vision_max_images"/>
+          </div>
+          <p class="hint">关闭时图片只以「[图片]」文本进入上下文。开启前请确认上面的模型支持图片输入（如 qwen-vl-max、glm-4v、gpt-4o）；DeepSeek 的 deepseek-chat 不支持。</p>
         </div>
         <div class="actions">
           <button class="btn ghost" id="btn-test">测试连接</button>

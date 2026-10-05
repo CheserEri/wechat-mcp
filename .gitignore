@@ -29,6 +29,10 @@ Desktop.ini
 # 临时文件
 .tmp/
 
+# 本地工具与调试产物（不入库）
+.workbuddy-ai/
+_cardtest/
+
 # DSH 插件：随包分发的独立运行时（由 packaging/build.py + stage-runtime.mjs 生成）
 dsh-plugin/bin/wechat-mcp/
 dsh-plugin/node_modules/

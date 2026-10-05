@@ -17,18 +17,33 @@ $$("#nav .nav-item").forEach((item) => {
 });
 
 // ---------------- 数据绑定 ----------------
+// range 滑块的数值标签：由 data-val 指向同页的 <span>，避免写死单个 id。
+function rangeLabel(el) {
+  const id = el.dataset.val;
+  return id ? document.getElementById(id) : null;
+}
+
+function fmtRange(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? String(Math.round(n * 100) / 100) : "";
+}
+
 function bindDraftToControls() {
   $$("[data-key]").forEach((el) => {
     const key = el.dataset.key;
     if (el.type === "checkbox") el.checked = !!draft[key];
     else el.value = draft[key] ?? "";
-    if (el.type === "range") $("#temp-val").textContent = Number(draft[key]).toFixed(1);
+    if (el.type === "range") {
+      const label = rangeLabel(el);
+      if (label) label.textContent = fmtRange(draft[key]);
+    }
 
     el.addEventListener("input", () => {
       if (el.type === "checkbox") draft[key] = el.checked;
       else if (el.type === "range") {
         draft[key] = parseFloat(el.value);
-        $("#temp-val").textContent = Number(el.value).toFixed(1);
+        const label = rangeLabel(el);
+        if (label) label.textContent = fmtRange(el.value);
       } else draft[key] = el.value;
     });
   });
@@ -69,6 +84,9 @@ async function saveAll() {
   toast("设置已保存");
 }
 $("#save-chats").addEventListener("click", saveAll);
+$("#save-human").addEventListener("click", saveAll);
+$("#save-quiet").addEventListener("click", saveAll);
+$("#save-links").addEventListener("click", saveAll);
 $("#save-model").addEventListener("click", saveAll);
 $("#save-persona").addEventListener("click", saveAll);
 

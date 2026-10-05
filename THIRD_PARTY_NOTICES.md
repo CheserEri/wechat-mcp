@@ -23,7 +23,24 @@
 
 ---
 
-## 2. 冻结运行时内置的第三方 Python 包
+## 2. 内置源码：`vendor/yt_dlp/`（来源：yt-dlp）
+
+| 项 | 说明 |
+| --- | --- |
+| 目录 | `vendor/yt_dlp/`（含许可证副本 `vendor/yt_dlp/LICENSE`） |
+| 来源项目 | yt-dlp（<https://github.com/yt-dlp/yt-dlp>） |
+| 版本 | `2026.08.19`（取自源码包 `yt_dlp/version.py`） |
+| 用途 | 桌面助手检测到聊天中的链接时解析元数据；按需下载音视频。同时被 PyInstaller 冻结打包内置（构建产物内为 `_internal/yt_dlp/`） |
+| 修改情况 | **未修改**，原样收录上游 `yt_dlp` 包（已剔除 `__pycache__`） |
+
+> **授权：The Unlicense（公有领域）。** yt-dlp 以 Unlicense 发布，允许任意用途的
+> 复制、修改、分发。许可证全文见 `vendor/yt_dlp/LICENSE`。
+> 注意：yt-dlp 本身依赖/可选依赖若干第三方组件，其各自许可见上游仓库的
+> `THIRD_PARTY_LICENSES.txt`；本仓库仅收录 `yt_dlp` 包自身源码。
+
+---
+
+## 3. 冻结运行时内置的第三方 Python 包
 
 `packaging/` 构建出的独立运行时（`dist/wechat-mcp/`、`dsh-plugin/bin/wechat-mcp/`）
 会打包若干第三方 Python 包，例如：
@@ -46,7 +63,7 @@
 
 ---
 
-## 3. 上游项目最初的依赖说明
+## 4. 上游项目最初的依赖说明
 
 上游 `deepseekgirl` 在其 `requirements.*.txt` 中引用了
 `wxauto`（<https://github.com/cluic/wxauto>）等第三方项目。本仓库仅使用

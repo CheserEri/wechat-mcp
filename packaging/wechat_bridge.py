@@ -31,6 +31,7 @@ import queue
 import random
 import re
 import subprocess
+import tempfile
 import time
 import threading
 from ctypes import wintypes
@@ -538,6 +539,8 @@ class WeChatMessage:
     poke_sender: str = ""       # 拍一拍发起人的显示名
     is_image_request: bool = False  # 是否要求机器人联网找图片
     voice_path: str = ""        # 已提取到本地的语音文件（供 ASR 使用）
+    # wechat-mcp 新增：已提取到本地的图片文件（供视觉模型识别）。
+    image_path: str = ""
     voice_url: str = ""         # 远端语音附件地址（QQ）
     voice_mime: str = ""        # 语音附件 MIME
     voice_filename: str = ""    # 远端语音附件文件名
@@ -1324,6 +1327,10 @@ class WeChatBridge:
             voice_path = ""
             if message_type == "voice":
                 voice_path = self._extract_voice_file(msg, chat_id)
+            # wechat-mcp 新增：图片消息提取到本地，供视觉模型识别。
+            image_path = ""
+            if message_type == "image":
+                image_path = self._extract_image_file(msg, chat_id)
 
             # wechat-mcp 新增：解析引用/回复的目标显示名。
             reply_to_name = self._extract_reply_target(raw_content)
@@ -1353,6 +1360,7 @@ class WeChatBridge:
                 is_self=is_self,
                 poke_sender=poke_sender,
                 voice_path=voice_path,
+                image_path=image_path,
                 reply_to_name=reply_to_name,
             )
 
@@ -1371,37 +1379,57 @@ class WeChatBridge:
         except Exception as e:
             logger.error(f"消息处理异常: {e}")
 
+    def _resolve_media_context(self, msg, chat_id: str):
+        """解析媒体提取所需的 ``(local_id, db, user)``；上下文不全返回 None。
+
+        ``user`` 必须是**会话** wxid：media 库按会话（``chat_name_id`` /
+        ``msg/attach/<md5(会话)>``）分组。关键点：全局监听（``AddListenAll``）下
+        ``msg.parent.root`` 是只有 ``.who``/``._wxid``、**没有 ``_db``** 的
+        ``_AllMessageChat`` 占位，所以 db 必须回退到桥接层自身的句柄
+        ``self._wx._db``，否则媒体提取会静默失败。
+        """
+        local_id = getattr(msg, "local_id", None)
+        parent = getattr(msg, "parent", None)
+        chat = getattr(parent, "root", None) or parent
+        db = (
+            getattr(chat, "_db", None)
+            or getattr(parent, "_db", None)
+            or getattr(self._wx, "_db", None)
+        )
+        if local_id is None or db is None:
+            return None
+        user = str(
+            getattr(chat, "_wxid", "")
+            or getattr(parent, "_wxid", "")
+            or chat_id
+        ).strip()
+        if not user:
+            return None
+        try:
+            return int(local_id), db, user
+        except (TypeError, ValueError):
+            return None
+
     def _extract_voice_file(self, msg, chat_id: str) -> str:
         """Extract a wechatauto voice message from the local media database."""
         if self._backend != "wechatauto":
             logger.debug(f"[微信] {self._backend} 后端暂不提取语音文件")
             return ""
 
-        local_id = getattr(msg, "local_id", None)
-        chat = getattr(msg, "parent", None)
-        root = getattr(chat, "root", None)
-        db = getattr(root, "_db", None) or getattr(chat, "_db", None)
-        if local_id is None or db is None:
+        ctx = self._resolve_media_context(msg, chat_id)
+        if ctx is None:
             logger.debug(f"[微信] 语音消息缺少媒体上下文: {chat_id}")
             return ""
+        local_id, db, user = ctx
 
-        user = str(
-            getattr(root, "_wxid", "")
-            or getattr(chat, "_wxid", "")
-            or getattr(msg, "wxid", "")
-            or chat_id
-        ).strip()
-        if not user:
-            return ""
-
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        save_dir = os.path.join(root, "data", "voice_inbox")
+        # 写到系统临时目录：冻结打包后包内路径不可靠，临时目录一定可写。
+        save_dir = os.path.join(tempfile.gettempdir(), "wechat-mcp", "voice")
         try:
             from wechatauto.media import MediaDownloader
 
             path = MediaDownloader(db, save_dir=save_dir).download_voice(
                 user,
-                int(local_id),
+                local_id,
                 save_dir=save_dir,
             )
             if path:
@@ -1412,6 +1440,41 @@ class WeChatBridge:
             )
         except Exception as exc:
             logger.warning(f"[微信] 提取语音文件失败: {exc}")
+        return ""
+
+    def _extract_image_file(self, msg, chat_id: str) -> str:
+        """Extract a wechatauto image message from the local media database.
+
+        wechat-mcp 新增：镜像 ``_extract_voice_file``，把图片解密落盘，
+        供上层交给视觉模型识别。群聊图片默认只有缩略图，原图需在微信中
+        点开过才会下载，故这里通常拿到的是缩略图。
+        """
+        if self._backend != "wechatauto":
+            logger.debug(f"[微信] {self._backend} 后端暂不提取图片文件")
+            return ""
+
+        ctx = self._resolve_media_context(msg, chat_id)
+        if ctx is None:
+            logger.debug(f"[微信] 图片消息缺少媒体上下文: {chat_id}")
+            return ""
+        local_id, db, user = ctx
+
+        # 写到系统临时目录：冻结打包后包内路径不可靠，临时目录一定可写。
+        save_dir = os.path.join(tempfile.gettempdir(), "wechat-mcp", "images")
+        try:
+            from wechatauto.media import MediaDownloader
+
+            path = MediaDownloader(db, save_dir=save_dir).download_image(
+                user,
+                local_id,
+                save_dir=save_dir,
+            )
+            if path:
+                logger.info(f"[微信] 已提取图片文件: {path}")
+                return str(path)
+            logger.debug(f"[微信] 本地媒体库未找到图片: {chat_id}/{local_id}")
+        except Exception as exc:
+            logger.warning(f"[微信] 提取图片文件失败: {exc}")
         return ""
 
     @staticmethod
@@ -1585,11 +1648,35 @@ class WeChatBridge:
                 text = text[len(prefix):].lstrip()
         text = re.sub(r"^wxid_[A-Za-z0-9_-]{4,}\s*:\s*", "", text)
 
+        # 微信图片/表情/卡片消息常带 XML 声明（<?xml version="1.0"?>）。
+        # 不先剥掉声明，"<msg" 判断会失配，导致整段原始 XML 漏进上下文。
+        if text.startswith("<?xml"):
+            decl_end = text.find("?>")
+            if decl_end != -1:
+                text = text[decl_end + 2:].lstrip()
+
         if text.startswith("<msg"):
             if "<emoji" in text:
                 return "[表情]"
             if "<img" in text:
                 return "[图片]"
+
+            # 链接/分享卡片：原实现只保留标题、丢掉 <url>，下游拿不到链接，
+            # 无法做链接解析。wechat-mcp 修改：保留标题的同时附上链接 URL。
+            link_url = ""
+            url_match = re.search(
+                r"<url\b[^>]*>(.*?)</url>",
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if url_match:
+                link_url = re.sub(
+                    r"<!\[CDATA\[(.*?)\]\]>",
+                    r"\1",
+                    url_match.group(1),
+                    flags=re.DOTALL,
+                )
+                link_url = re.sub(r"\s+", "", link_url).strip()
 
             title_match = re.search(
                 r"<title\b[^>]*>(.*?)</title>",
@@ -1605,7 +1692,9 @@ class WeChatBridge:
                 ).strip()
                 title = re.sub(r"\s+", " ", title)
                 if title:
-                    return title[:300]
+                    return (
+                        f"{title[:300]}\n{link_url}" if link_url else title[:300]
+                    )
 
             desc_match = re.search(
                 r"<des\b[^>]*>(.*?)</des>",
@@ -1615,8 +1704,10 @@ class WeChatBridge:
             if desc_match:
                 desc = re.sub(r"\s+", " ", desc_match.group(1)).strip()
                 if desc:
-                    return desc[:300]
-            return "[卡片消息]"
+                    return (
+                        f"{desc[:300]}\n{link_url}" if link_url else desc[:300]
+                    )
+            return link_url or "[卡片消息]"
 
         return text.strip()
 
