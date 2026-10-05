@@ -14,8 +14,10 @@ pywebview 6.x 不支持把 ``async def`` 暴露给 JS（其桥接无 asyncio 集
 from __future__ import annotations
 
 import asyncio
+import io
 import sys
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,166 @@ def webui_dir() -> Path:
         if candidate.is_dir():
             return candidate
     return Path(__file__).resolve().parent / "webui"
+
+
+def window_icon() -> Path | None:
+    """定位窗口图标：冻结包用 _MEIPASS/wechat-mcp.ico，源码用 packaging/wechat-mcp.ico。
+
+    必须显式传给 ``webview.start(icon=...)``：不传时 pywebview 会从
+    ``sys.executable`` 提取图标，而源码方式运行时那里是 ``python.exe``，
+    窗口标题栏与任务栏就会显示 Python 图标。
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    candidates = []
+    if base:
+        candidates.append(Path(base) / "wechat-mcp.ico")
+    candidates.append(
+        Path(__file__).resolve().parents[2] / "packaging" / "wechat-mcp.ico"
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+class _UiLogSink:
+    """把控制台输出并入界面「运行日志」。
+
+    exe 是控制台程序（MCP stdio 模式要靠 stdout 通信），打包后的桌面端启动时会
+    附带一个黑色命令行窗口。启动时把它隐藏掉，原本打在里面的内容（loguru 日志、
+    ``print``、异常回溯）改由这里转投到引擎的日志缓冲，界面照常轮询显示。
+
+    引擎在后台线程里延迟创建，此前的输出先暂存，引擎就绪后补发。
+    """
+
+    def __init__(self, maxlen: int = 200) -> None:
+        self._lock = threading.Lock()
+        self._engine: BotEngine | None = None
+        self._pending: deque[tuple[str, str]] = deque(maxlen=maxlen)
+
+    def attach(self, engine: BotEngine) -> None:
+        with self._lock:
+            self._engine = engine
+            pending, self._pending = self._pending, deque(maxlen=200)
+        for level, line in pending:
+            engine.log(level, line)
+
+    def emit(self, level: str, message: str) -> None:
+        line = str(message).strip()
+        if not line:
+            return
+        with self._lock:
+            engine = self._engine
+            if engine is None:
+                self._pending.append((level, line))
+                return
+        engine.log(level, line)
+
+
+# 全局唯一：loguru sink、stdout/stderr 重定向与桌面 API 共用同一个收集器。
+UI_LOG = _UiLogSink()
+
+# loguru 级别名 → 界面日志级别（对应 style.css 的 .log-* 配色）。
+_LOGURU_LEVELS = {
+    "TRACE": "debug",
+    "DEBUG": "debug",
+    "INFO": "info",
+    "SUCCESS": "info",
+    "WARNING": "warning",
+    "ERROR": "error",
+    "CRITICAL": "error",
+}
+
+
+def _guess_level(text: str) -> str:
+    """从裸文本（print / 回溯）里猜一个日志级别。"""
+    upper = text.upper()
+    if "| ERROR" in upper or "ERROR:" in upper or "TRACEBACK" in upper:
+        return "error"
+    if "| WARNING" in upper or "WARN" in upper:
+        return "warning"
+    if "| DEBUG" in upper:
+        return "debug"
+    return "info"
+
+
+class _TeeStream(io.TextIOBase):
+    """写入时同时转给原控制台与界面运行日志的流。"""
+
+    def __init__(self, original: Any) -> None:
+        self._original = original
+        self._buffer = ""
+
+    def write(self, text: str) -> int:
+        if self._original is not None:
+            try:
+                written = self._original.write(text)
+            except Exception:  # noqa: BLE001 - 原控制台不可写时以本次写入为准
+                written = len(text)
+        else:
+            written = len(text)
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            text_line = line.rstrip("\r")
+            if text_line.strip():
+                UI_LOG.emit(_guess_level(text_line), text_line)
+        return written
+
+    def flush(self) -> None:
+        if self._original is not None:
+            try:
+                self._original.flush()
+            except Exception:  # noqa: BLE001 - 冲刷失败无需上报
+                pass
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        if self._original is None:
+            raise OSError("没有可用的文件描述符")
+        return self._original.fileno()
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._original, "encoding", None) or "utf-8"
+
+    def __getattr__(self, name: str) -> Any:
+        # 未覆盖的属性（如 .buffer）回落到原控制台流；下划线名字直接拒绝，
+        # 避免 _original 尚未赋值时无限递归。
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._original, name)
+
+
+def install_console_capture() -> None:
+    """接管控制台输出，让桌面端不再需要那个黑色命令行窗口。
+
+    loguru 的默认 sink 在它自己被导入时就绑定了当时的 ``sys.stderr``，之后再替换
+    ``sys.stderr`` 也收不到它的输出，因此这里另外挂一个 sink。
+    """
+    try:
+        from loguru import logger
+    except Exception:  # noqa: BLE001 - 没有 loguru 时只接管 print/回溯
+        logger = None
+    if logger is not None:
+        try:
+            logger.add(
+                lambda message: UI_LOG.emit(
+                    _LOGURU_LEVELS.get(message.record["level"].name, "info"),
+                    message,
+                ),
+                format="{message}",
+                colorize=False,
+                level="INFO",
+            )
+        except Exception:  # noqa: BLE001 - 挂载失败不影响界面运行
+            pass
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is not None and not isinstance(stream, _TeeStream):
+            setattr(sys, name, _TeeStream(stream))
 
 
 class _AsyncHub:
@@ -80,6 +242,8 @@ class DesktopApi:
         self.adapter = DeepSeekGirlAdapter(AdapterConfig.from_env())
         self.config = BotConfig.load()
         self.engine = BotEngine(self.adapter, self.config)
+        # 引擎就绪后接管控制台输出，连接微信期间的日志即可直接显示到界面。
+        UI_LOG.attach(self.engine)
         # 连接失败不阻塞界面，用户可在状态页重连。
         await self.adapter.connect()
         if self.config.enabled:
@@ -180,6 +344,9 @@ def _show_fatal(message: str) -> None:
 
 
 def run() -> None:
+    # 先把控制台输出接管到界面运行日志，再启动窗口；这样启动期的日志也不会丢。
+    install_console_capture()
+
     index = webui_dir() / "index.html"
     if not index.is_file():
         raise SystemExit(f"缺少前端入口: {index}")
@@ -208,8 +375,9 @@ def run() -> None:
     if unblocked:
         print(f"已清除 {unblocked} 个内置程序集的 Internet 区域标记。")
 
+    icon = window_icon()
     try:
-        webview.start()
+        webview.start(icon=str(icon) if icon else None)
     except Exception as exc:  # noqa: BLE001 - 兜底成可读提示，避免黑屏
         _show_fatal(
             "界面启动失败："

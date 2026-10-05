@@ -45,6 +45,8 @@ if not (VENDOR / "yt_dlp" / "__init__.py").is_file():
 datas = [
     (str(BRIDGE), "."),
     (str(WEBUI), "webui"),
+    # 窗口图标：桌面端启动时显式传给 pywebview（与 exe 内嵌图标同一文件）。
+    (str(ICON), "."),
 ]
 binaries = []
 hiddenimports = [

@@ -168,7 +168,7 @@ textarea { resize: vertical; line-height: 1.6; }
 .log-info { color: var(--text); }
 .log-debug { color: var(--text-3); }
 .log-error { color: var(--red); }
-.log-warn { color: var(--amber); }
+.log-warn, .log-warning { color: var(--amber); }
 
 /* ---------------- Toast ---------------- */
 .toast {

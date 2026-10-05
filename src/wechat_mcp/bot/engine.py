@@ -17,6 +17,7 @@ import base64
 import math
 import random
 import re
+import threading
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
@@ -140,6 +141,10 @@ class BotEngine:
         self._history: dict[str, deque[HistoryItem]] = {}
         self._log_lines: deque[LogLine] = deque(maxlen=500)
         self._log_seq = 0
+        # 日志可能来自任意线程（适配层回调、下载线程、桌面壳的控制台输出），
+        # 而 get_logs 会整体遍历该 deque——并发追加会触发
+        # 「deque mutated during iteration」，故读写都加同一把锁。
+        self._log_lock = threading.Lock()
         self._cooldown_until: dict[str, float] = {}
         self._processed_ids: deque[str] = deque(maxlen=1000)
         # 已做过「链接服务」的消息 ID。与 _processed_ids 分开：链接服务独立于
@@ -939,21 +944,29 @@ class BotEngine:
         }
 
     def get_logs(self, after_seq: int = 0) -> list[dict[str, Any]]:
-        return [
-            asdict(line)
-            for line in self._log_lines
-            if line.seq > int(after_seq or 0)
-        ]
+        with self._log_lock:
+            lines = [
+                asdict(line)
+                for line in self._log_lines
+                if line.seq > int(after_seq or 0)
+            ]
+        return lines
+
+    def log(self, level: str, message: str) -> None:
+        """外部（桌面壳）把控制台输出并入运行日志。"""
+        self._log(level, message)
 
     def _log(self, level: str, message: str) -> None:
-        self._log_seq += 1
-        line = LogLine(
-            seq=self._log_seq,
-            level=level,
-            message=message,
-            timestamp=time.time(),
-        )
-        self._log_lines.append(line)
+        with self._log_lock:
+            self._log_seq += 1
+            line = LogLine(
+                seq=self._log_seq,
+                level=level,
+                message=message,
+                timestamp=time.time(),
+            )
+            self._log_lines.append(line)
+        # 回调在锁外调用：它可能再次写日志，避免同一把非重入锁死锁。
         if self.on_log is not None:
             try:
                 self.on_log(line)
