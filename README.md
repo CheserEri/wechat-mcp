@@ -34,10 +34,25 @@
 
 ## 安装
 
-### 方式一：预编译独立包（推荐，无需 Python）
+### 方式零：Windows 安装包（最省事，推荐给普通用户）
+
+从 [GitHub Releases](https://github.com/CheserEri/wechat-mcp/releases) 下载
+`wechat-mcp-setup-x64.exe` 双击安装即可。向导支持中文/英文，会创建开始菜单
+（以及可选桌面）快捷方式，并在控制面板「应用」里登记卸载项。
+
+- **按用户安装**到 `%LOCALAPPDATA%\Programs\wechat-mcp`，**不弹 UAC**；
+  安装目录可写（程序会在 exe 同级写 `logs\`）。
+- 安装程序自己写文件，**不会**带「Internet 区域」标记，因此不会遇到解压 zip
+  才有的「打开黑屏」问题。
+
+### 方式一：预编译独立包（无需 Python）
 
 从 [GitHub Releases](https://github.com/CheserEri/wechat-mcp/releases) 下载
 `wechat-mcp-win32-x64.zip`，解压后直接把 `wechat-mcp.exe` 配到 MCP 客户端即可：
+
+> 解压前请先对压缩包**右键 → 属性 → 勾选「解除锁定」**，否则解压出来的程序集
+> 会被标记为「来自 Internet」，.NET 拒绝加载，界面会黑屏（新版启动时会自动修复，
+> 但提前解除更省事）。
 
 ```json
 {
@@ -68,6 +83,11 @@
 ```powershell
 .\wechat-mcp.exe --gui
 ```
+
+> 若窗口出来是**一片黑**：多为解压时文件被标记为「来自 Internet」，.NET 拒绝加载
+> 内置的 pythonnet 程序集。新版启动时会自动清除该标记；万一仍黑屏，请对压缩包
+> **右键 → 属性 → 勾选「解除锁定」**后重新解压。详见
+> [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#桌面端--gui-启动后黑屏)。
 
 **自检与链接解析诊断**：不确定打包版是否正常时，可跑这几条命令（都不启动微信）：
 
@@ -185,14 +205,15 @@ python -m venv .venv
 ## 构建与发布
 
 ```powershell
-# 1. 生成独立运行时（onedir + zip），产物在 dist\
+# 1. 生成独立运行时（onedir + zip + 安装包），产物在 dist\
+#    安装包需要本机装有 Inno Setup 6（未装则自动跳过，只出 onedir + zip）
 .venv\Scripts\python.exe packaging\build.py
 
 # 2. 把运行时内置进 DSH 插件包
 node dsh-plugin\scripts\stage-runtime.mjs
 
 # 3. 发布 GitHub Release（需已登录 gh）
-gh release create v0.3.0 dist\wechat-mcp-win32-x64.zip --title "v0.3.0" --notes "…"
+gh release create v0.8.0 dist\wechat-mcp-win32-x64.zip dist\wechat-mcp-setup-x64.exe --title "v0.8.0" --notes "…"
 
 # 4. 发布 npm 插件（prepack 会自动执行第 2 步）
 cd dsh-plugin

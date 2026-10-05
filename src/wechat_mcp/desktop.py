@@ -25,6 +25,7 @@ from .adapters.deepseekgirl import DeepSeekGirlAdapter
 from .bot import BotConfig, BotEngine
 from .bot.llm import LLMClient, LLMError
 from .config import AdapterConfig
+from .unblock import unblock_bundled_assemblies
 
 
 def webui_dir() -> Path:
@@ -159,17 +160,40 @@ class DesktopApi:
         return self._call(self._reset_persona_async())
 
 
+def _show_fatal(message: str) -> None:
+    """界面起不来时弹一个错误框。
+
+    双击启动没有控制台，一旦 ``webview.start()`` 抛异常，用户只会看到
+    黑屏/闪退，毫无线索。这里把原因显示出来。
+    """
+    print(message, file=sys.stderr)
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(
+            None, message, "灵语 启动失败", 0x10
+        )
+    except Exception:  # noqa: BLE001 - 弹框失败不能再掩盖原始异常
+        pass
+
+
 def run() -> None:
     index = webui_dir() / "index.html"
     if not index.is_file():
         raise SystemExit(f"缺少前端入口: {index}")
+
+    # 从 zip 解压的冻结包会被打上「Internet 区域」标记，.NET 拒绝加载
+    # 带标记的程序集 → pythonnet 起不来 → 黑屏。这里先自行清除。
+    unblocked = unblock_bundled_assemblies()
 
     hub = _AsyncHub()
     hub.start()
     api = DesktopApi(hub)
 
     webview.create_window(
-        "微信自动助手",
+        "灵语",
         url=index.as_uri(),
         js_api=api,
         width=1180,
@@ -181,7 +205,20 @@ def run() -> None:
     # 后台初始化（连接微信可能耗时），完成后放行其它 API。
     threading.Thread(target=api.bootstrap, daemon=True).start()
 
-    webview.start()
+    if unblocked:
+        print(f"已清除 {unblocked} 个内置程序集的 Internet 区域标记。")
+
+    try:
+        webview.start()
+    except Exception as exc:  # noqa: BLE001 - 兜底成可读提示，避免黑屏
+        _show_fatal(
+            "界面启动失败："
+            f"{exc}\n\n"
+            "若提示无法加载 Python.Runtime.dll，通常是解压时文件被标记为"
+            "「来自 Internet」。请右键压缩包 → 属性 → 勾选「解除锁定」，"
+            "然后重新解压。"
+        )
+        raise
 
 
 if __name__ == "__main__":

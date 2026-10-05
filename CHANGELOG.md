@@ -60,6 +60,21 @@
     · 含 1 张图 · 458 喜欢；简介：<正文>`。
   - 若该推文**含视频**，会在卡片之后再按链接下载流程把视频发回；卡片渲染失败时
     自动退回原下载路径，不会因为渲染异常而丢内容。
+- **Windows 安装包**（`packaging/installer.iss` + `build.py`）：
+  `build.py` 现在在 onedir 与 zip 之后，自动用 **Inno Setup 6** 编译出
+  `dist\wechat-mcp-setup-x64.exe`（当前约 60.8 MB，lzma2 固实压缩，比 zip 还小）。
+  安装包提供中文/英文向导、开始菜单与可选桌面快捷方式、控制面板卸载项。
+  - **按用户安装**（`PrivilegesRequired=lowest` + `{localappdata}\Programs\wechat-mcp`）：
+    不弹 UAC，且安装目录可写——程序会在 exe 同级写 `logs\`，装到 Program Files 反而会失败。
+  - 安装程序自己写文件，**不会**带上「Internet 区域」标记，从根上避免上一节
+    那个 pythonnet 被 .NET 拒绝加载的黑屏问题。
+  - 未安装 Inno Setup 时自动跳过安装包（只出 onedir + zip），可用环境变量
+    `ISCC` 指定编译器路径，或 `build.py --no-installer` 显式跳过。
+  - 应用图标由 `packaging/make_icon.py` 渲染项目所用的鲸鱼标志（🐋，16~256 px
+    多尺寸 `.ico`），同时用于 exe 与安装包，无需外部素材。
+  - 桌面端显示名统一为「**灵语**」（窗口标题、侧栏品牌、安装包与快捷方式）；
+    技术标识（`wechat-mcp` 包名/exe 名、AppId、npm 包名、MCP 工具前缀）保持不变，
+    以便后续适配 QQ 等其他聊天软件。
 
 ### 修复
 
@@ -78,6 +93,14 @@
 - 修复**下载回发会卡住机器人**的问题：`_consume` 串行消费消息队列，而 `_handle`
   会 `await` 下载——一个 21 分钟的视频能把后续消息全积压几分钟。现改为后台任务
   （`_schedule_download`），并按 URL 去重，同一链接不会并发重复下载。
+- 修复**解压即黑屏**的问题：从 zip 解压出来的文件会被 Windows 打上
+  「Internet 区域」标记（`Zone.Identifier`，`ZoneId=3`），而 .NET Framework
+  出于安全**拒绝加载**带该标记的程序集，于是 pythonnet 初始化失败
+  （`Failed to resolve Python.Runtime.Loader.Initialize from …Python.Runtime.dll`）、
+  pywebview 起不来，界面只剩一片黑。现在桌面端启动时会自动清除内置程序集
+  （`pythonnet/runtime/*.dll`、`webview/lib/**/*.dll`）上的该标记（`unblock.py`），
+  用户无需手动「解除锁定」；万一仍失败，也会弹出可读的错误框说明原因与解法，
+  而不是静默黑屏。
 
 ### 变更
 
@@ -109,10 +132,11 @@
   （`bv*+ba/b`），否则退化为单文件，避免因缺 ffmpeg 直接失败。打包版内置
   `imageio_ffmpeg` 自带的 ffmpeg（约 84 MB）与 `winsdk`（约 43 MB），故冻结包
   体积明显增大（onedir 约 205 MB）。
-- 全套 238 项单元测试通过（新增链接抽取、短链展开、推文识别/解析/token 校验/
+- 全套 250 项单元测试通过（新增链接抽取、短链展开、推文识别/解析/token 校验/
   卡片渲染、引擎「先卡片后视频」、群聊未 @ 也回固定提示/下载、提示文案与开关、
   静默时段与群范围跳过、同消息去重、配置钳制、引擎注入/下载回发、下载路径抓取、
-  链接卡片归一化、`--resolve` / `--tweet` 诊断等用例）。
+  链接卡片归一化、Internet 区域标记清除、打包脚本版本解析/ISCC 定位、
+  `--resolve` / `--tweet` 诊断等用例）。
 - 冻结包已实测：`--selfcheck` 报 `yt_dlp_version: 2026.08.19`；
   `--resolve` 可解析网页（`example.com`）、通用媒体（`Generic`，含下载）、
   站点提取器（B 站 `BiliBili`）与短链（`b23.tv` 有效/失效两种情形）；

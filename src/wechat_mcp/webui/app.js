@@ -1,4 +1,4 @@
-/* 微信自动助手 - 前端逻辑（pywebview JS API） */
+/* 灵语 - 前端逻辑（pywebview JS API） */
 
 let draft = null;       // 当前编辑中的配置
 let lastLogSeq = 0;

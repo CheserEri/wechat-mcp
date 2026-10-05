@@ -28,6 +28,8 @@ ROOT = SPEC_DIR.parent
 BRIDGE = SPEC_DIR / "wechat_bridge.py"
 WEBUI = ROOT / "src" / "wechat_mcp" / "webui"
 VENDOR = ROOT / "vendor"
+# 应用图标（由 packaging/make_icon.py 生成），同时供 exe 与安装包使用。
+ICON = SPEC_DIR / "wechat-mcp.ico"
 
 if not BRIDGE.is_file():
     raise SystemExit(
@@ -126,6 +128,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=True,
+    icon=str(ICON) if ICON.is_file() else None,
 )
 
 coll = COLLECT(

@@ -83,6 +83,35 @@
 - 「下载并回发」默认关闭；开启后下载目录会被自动纳入发送白名单，否则回发会被
   `path_not_allowed` 拒绝。
 
+## 桌面端（`--gui`）启动后黑屏
+
+现象：双击 `wechat-mcp.exe`，窗口出来了但一片黑（或闪一下就没了），
+`logs/` 里什么都没有。
+
+原因：从 zip 解压出来的文件会被 Windows 打上「Internet 区域」标记
+（`Zone.Identifier` 数据流，`ZoneId=3`）。.NET Framework 出于安全**默认拒绝加载**
+带该标记的程序集，于是 pythonnet 初始化失败、pywebview 的窗口画不出内容：
+
+```
+RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize
+from <安装目录>\_internal\pythonnet\runtime\Python.Runtime.dll
+```
+
+本地直接构建的 `dist/` 没有这个标记，所以「本机能跑、发给别人就黑屏」。
+
+处理：
+
+1. 新版本启动时会**自动清除**内置程序集上的该标记，正常情况下无需干预。
+2. 若仍黑屏，把安装目录里所有文件解除锁定，或重新解压前先对压缩包
+   **右键 → 属性 → 勾选「解除锁定」**。命令行方式（PowerShell）：
+
+   ```powershell
+   Get-ChildItem -Path <安装目录> -Recurse -File | Unblock-File
+   ```
+
+3. 自检确认：`wechat-mcp.exe --selfcheck` 不依赖 GUI，能跑通说明解释器与内置
+   依赖没问题，黑屏就属于窗口/标记层面。
+
 ## 日志与审计
 
 - 运行日志输出到 **stderr**，不污染 stdio 协议消息。若在客户端看不到日志属正常。
