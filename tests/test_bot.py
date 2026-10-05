@@ -943,6 +943,28 @@ class SendTargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.error["code"], "chat_id_unresolved")
         self.assertEqual(adapter._bridge.sent, [])
 
+    async def test_unresolved_group_error_tells_user_to_name_the_group(self):
+        """群聊反查不到名字时，错误里必须直接说清「去给群设个群名称」。
+
+        无名群是最容易踩的坑：群里 @ 了机器人、模型也答了，但微信搜索框没有名字
+        可用，回复就是发不出去。只报「无法解析会话名」用户根本猜不到原因。
+        """
+        adapter = DeepSeekGirlAdapter()
+        adapter._bridge = _FakeBridge(db=_FakeDB([]))
+        result = await adapter.send_message(ROOM_ID, "hi")
+        self.assertFalse(result.ok)
+        self.assertIn("群名称", result.error["message"])
+        self.assertIn(ROOM_ID, result.error["message"])
+
+    async def test_unresolved_private_error_has_no_group_hint(self):
+        """私聊没有群名一说，不要给出误导性的提示。"""
+        adapter = DeepSeekGirlAdapter()
+        adapter._bridge = _FakeBridge(db=_FakeDB([]))
+        result = await adapter.send_message("wxid_abc123", "hi")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error["code"], "chat_id_unresolved")
+        self.assertNotIn("群名称", result.error["message"])
+
     async def test_id_resolved_before_send(self):
         adapter = DeepSeekGirlAdapter()
         adapter._bridge = _FakeBridge(
@@ -1262,6 +1284,136 @@ class BridgeAtDetectionTests(unittest.TestCase):
         bridge._load_bot_identity()
         self.assertEqual(bridge._bot_names, {"群助手", "wxid_new"})
         self.assertEqual(bridge._self_wxid, "wxid_new")
+
+
+class BridgeRoomNameTests(unittest.TestCase):
+    """无名群（微信里没设群名称）的显示名兜底。
+
+    背景：群聊如果没设群名称，contact.db 里的 ``nick_name`` / ``remark`` 都是空的，
+    而微信搜索框只认名字、不认 ``xxx@chatroom``——发送前定位不到会话，表现就是
+    「群里 @ 了机器人、模型也答了，但群里就是不出现回复」。这里按微信自己的显示
+    习惯（成员昵称拼起来）给一个可搜索名兜底。
+    """
+
+    @staticmethod
+    def _module():
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[1]
+        module_file = root / "packaging" / "wechat_bridge.py"
+        spec = importlib.util.spec_from_file_location(
+            "packaged_wechat_bridge_room", module_file
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    class _Db:
+        def __init__(self, nickname="", members=()):
+            self.nickname = nickname
+            self.members = list(members)
+            self.group_member_calls = 0
+
+        def get_nickname(self, chat_id):
+            return self.nickname
+
+        def get_group_members(self, chat_id):
+            self.group_member_calls += 1
+            return list(self.members)
+
+    class _BoomDb:
+        @staticmethod
+        def get_nickname(chat_id):
+            return ""
+
+        @staticmethod
+        def get_group_members(chat_id):
+            raise RuntimeError("数据库读不了")
+
+    def _bridge(self, db):
+        module = self._module()
+        bridge = object.__new__(module.WeChatBridge)
+        bridge._wx = SimpleNamespace(_db=db)
+        bridge._room_names_by_id = {}
+        bridge._chat_names = {}
+        bridge._nameless_rooms_warned = set()
+        return bridge
+
+    def test_named_group_keeps_group_name(self):
+        bridge = self._bridge(self._Db(nickname="摸鱼群"))
+        self.assertEqual(bridge._chat_display_name("123@chatroom"), "摸鱼群")
+
+    def test_nameless_group_falls_back_to_member_names(self):
+        db = self._Db(
+            members=[
+                {"username": "wxid_a", "nick_name": "派蒙", "remark": ""},
+                {"username": "wxid_b", "nick_name": "旅行者", "remark": ""},
+                {"username": "wxid_c", "nick_name": "", "remark": ""},
+            ]
+        )
+        bridge = self._bridge(db)
+        self.assertEqual(bridge._chat_display_name("123@chatroom"), "派蒙、旅行者")
+
+    def test_remark_wins_over_nickname(self):
+        db = self._Db(
+            members=[
+                {"username": "wxid_a", "nick_name": "小明", "remark": "老板"},
+                {"username": "wxid_b", "nick_name": "小红", "remark": ""},
+            ]
+        )
+        bridge = self._bridge(db)
+        self.assertEqual(bridge._chat_display_name("123@chatroom"), "老板、小红")
+
+    def test_member_count_is_capped(self):
+        db = self._Db(
+            members=[
+                {"username": f"wxid_{i}", "nick_name": f"成员{i}", "remark": ""}
+                for i in range(6)
+            ]
+        )
+        bridge = self._bridge(db)
+        name = bridge._chat_display_name("123@chatroom")
+        self.assertEqual(name, "成员0、成员1、成员2")
+        self.assertEqual(len(name.split("、")), 3)
+
+    def test_single_member_name_is_not_guessed(self):
+        """只有一个成员名时不猜：微信搜索会先命中同名联系人，可能把群消息发进私聊。"""
+        db = self._Db(
+            members=[
+                {"username": "wxid_a", "nick_name": "派蒙", "remark": ""},
+                {"username": "wxid_b", "nick_name": "", "remark": ""},
+            ]
+        )
+        bridge = self._bridge(db)
+        self.assertEqual(bridge._chat_display_name("123@chatroom"), "123@chatroom")
+
+    def test_member_lookup_failure_keeps_chat_id(self):
+        bridge = self._bridge(self._BoomDb())
+        self.assertEqual(bridge._chat_display_name("123@chatroom"), "123@chatroom")
+
+    def test_nameless_group_is_warned_once(self):
+        db = self._Db(members=[])
+        bridge = self._bridge(db)
+        bridge._chat_display_name("123@chatroom")
+        self.assertIn("123@chatroom", bridge._nameless_rooms_warned)
+        bridge._chat_display_name("123@chatroom")
+        self.assertEqual(len(bridge._nameless_rooms_warned), 1)
+
+    def test_private_chat_untouched(self):
+        bridge = self._bridge(self._Db(nickname="", members=[]))
+        self.assertEqual(bridge._chat_display_name("wxid_x"), "wxid_x")
+
+    def test_display_name_is_cached(self):
+        db = self._Db(
+            members=[
+                {"username": "wxid_a", "nick_name": "派蒙", "remark": ""},
+                {"username": "wxid_b", "nick_name": "旅行者", "remark": ""},
+            ]
+        )
+        bridge = self._bridge(db)
+        bridge._chat_display_name("123@chatroom")
+        bridge._chat_display_name("123@chatroom")
+        self.assertEqual(db.group_member_calls, 1)
 
 
 class BridgeMediaContextTests(unittest.TestCase):

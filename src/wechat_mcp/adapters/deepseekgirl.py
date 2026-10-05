@@ -76,14 +76,27 @@ def _looks_like_chat_id(value: str) -> bool:
 
 
 def _unresolved_target_error(recipient: str) -> dict[str, Any]:
-    """会话 ID 无法解析成显示名时的结构化错误。"""
+    """会话 ID 无法解析成显示名时的结构化错误。
+
+    群聊**没有设置群名称**时，contact.db 里的 ``nick_name`` / ``remark`` 都是空的，
+    而微信搜索框只认名字、不认 ``xxx@chatroom`` 这种 ID——于是发送前定位不到会话，
+    表现就是「群里 @ 了机器人、日志里也有模型调用，但群里就是不出现回复」。
+    这种情况把原因和解决办法直接写进错误里，别让用户去猜「无法解析会话名」是什么意思。
+    """
+    value = str(recipient or "").strip()
+    hint = ""
+    if value.endswith("@chatroom"):
+        hint = (
+            "。该群还没有群名称，微信搜索框无法定位它；"
+            "请在微信里给这个群设置一个群名称（群设置 → 群名称）后再试"
+        )
     return {
         "code": "chat_id_unresolved",
         "message": (
-            f"无法把会话 ID「{recipient}」解析成可搜索的会话名，已拒绝发送，"
-            "避免误搜/误发到其它会话"
+            f"无法把会话 ID「{value}」解析成可搜索的会话名，已拒绝发送，"
+            f"避免误搜/误发到其它会话{hint}"
         ),
-        "detail": {"recipient": recipient},
+        "detail": {"recipient": value},
     }
 
 

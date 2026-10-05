@@ -607,6 +607,8 @@ class WeChatBridge:
     # 机器人昵称缓存的有效期：微信里改了昵称后不必重启程序——一旦遇到「有 @ 但
     # 没匹配上」的消息，就按这个间隔重读一次昵称（避免每条群消息都去查库）。
     IDENTITY_REFRESH_SECONDS = 60.0
+    # 无名群兜底名里最多拼几个成员昵称（微信界面上也是截断显示的，拼太多反而对不上）。
+    ROOM_NAME_MEMBER_LIMIT = 3
 
     # 这些账号的消息不参与私聊自动回复（公众号/系统号/文件传输助手等）
     IGNORED_PRIVATE_ACCOUNTS = {
@@ -650,6 +652,8 @@ class WeChatBridge:
         # 上次读取机器人昵称的时间（monotonic），用于「改昵称免重启」的刷新节流。
         self._identity_loaded_at = 0.0
         self._chat_names: dict[str, str] = {}
+        # 已经就「这个群没有群名称」提醒过的群，避免每次消息都刷同一条警告。
+        self._nameless_rooms_warned: set[str] = set()
         self._target_group_ids: set[str] = set()
         self._listen_all_active = False
         self._uia_available = False
@@ -1588,7 +1592,14 @@ class WeChatBridge:
         return False
 
     def _chat_display_name(self, chat_id: str) -> str:
-        """把会话 wxid 解析成可搜索的显示名（群名/联系人昵称）。"""
+        """把会话 wxid 解析成可搜索的显示名（群名/联系人昵称）。
+
+        群聊如果**没有设置群名称**，contact.db 里的 nick_name / remark 都是空的，
+        而微信搜索框只认名字、不认 ``xxx@chatroom`` 这种 ID——发送时就定位不到会话，
+        表现为「群里 @ 了机器人却收不到回复」。这里按微信自己的显示习惯兜底：
+        无名群在界面上就是「成员昵称、成员昵称…」，用它当可搜索名。
+        拼不出两个以上名字时保持 ID 不变，并提醒用户去设置群名称。
+        """
         cached = self._room_names_by_id.get(chat_id) or self._chat_names.get(chat_id)
         if cached:
             return cached
@@ -1600,10 +1611,51 @@ class WeChatBridge:
                 name = str(nickname).strip() or chat_id
         except Exception:
             pass
+        if name == chat_id and chat_id.endswith("@chatroom"):
+            fallback = self._room_name_from_members(chat_id)
+            if fallback:
+                name = fallback
+                logger.info(
+                    f"群 {chat_id} 没有群名称，已按成员昵称拼出可搜索名「{fallback}」"
+                )
+            elif chat_id not in self._nameless_rooms_warned:
+                self._nameless_rooms_warned.add(chat_id)
+                logger.warning(
+                    f"群 {chat_id} 没有群名称，微信搜索框无法定位它，"
+                    "该群里的回复发不出去；请在微信里给这个群设置一个群名称。"
+                )
         if chat_id == "filehelper":
             name = "文件传输助手"
         self._chat_names[chat_id] = name
         return name
+
+    def _room_name_from_members(self, chat_id: str) -> str:
+        """无名群兜底：用成员昵称拼出微信界面上显示的那个名字。
+
+        **至少要有两个非空昵称才返回**：只有一个名字时，微信搜索会先命中同名的
+        联系人，可能把群消息发进私聊，宁可不猜（返回空串，交给上层给出可操作的
+        错误提示）。成员顺序按 username 排序，与微信的展示顺序不保证一致，
+        所以这属于尽力而为——拼出来的名字能命中会话就发，命不中仍然会拒绝发送。
+        """
+        try:
+            members = self._wx._db.get_group_members(chat_id) or []
+        except Exception:
+            return ""
+        names: list[str] = []
+        for member in members:
+            try:
+                label = str(
+                    member.get("remark") or member.get("nick_name") or ""
+                ).strip()
+            except AttributeError:
+                continue
+            if label and label not in names:
+                names.append(label)
+            if len(names) >= self.ROOM_NAME_MEMBER_LIMIT:
+                break
+        if len(names) < 2:
+            return ""
+        return "、".join(names)
 
     def _detect_poke(self, raw_content: str) -> tuple[bool, str]:
         """识别拍一拍消息，返回 (是否拍了机器人, 发起人显示名)。
