@@ -182,6 +182,49 @@ def _short(text: Any, limit: int = 120) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()[:limit]
 
 
+def usable_cookies_file(path: str) -> str:
+    """把配置里的 cookies.txt 路径规整成 yt-dlp 可用的绝对路径。
+
+    留空、文件不存在、或指向目录时返回空串（等于不使用 Cookie），
+    避免把无效路径丢给 yt-dlp 反而让它整条提取都失败。
+    """
+    raw = str(path or "").strip().strip('"').strip("'")
+    if not raw:
+        return ""
+    candidate = Path(os.path.expandvars(os.path.expanduser(raw)))
+    try:
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return str(candidate)
+    except OSError:
+        return ""
+    return ""
+
+
+_COOKIE_HINT_RE = re.compile(
+    r"cookies?\s+(?:are\s+)?(?:needed|required)|"
+    r"fresh cookies|"
+    r"sign in to confirm|"
+    r"login required|"
+    r"DPAPI",
+    re.IGNORECASE,
+)
+
+
+def _cookie_hint(detail: str) -> str:
+    """把「缺 Cookie」这类失败翻译成人话，提示用户去配 cookies.txt。
+
+    抖音、微博、小红书等站点会对未带 Cookie 的请求返回 403，yt-dlp 的原话是
+    ``Fresh cookies (not necessarily logged in) are needed``——不翻译的话，
+    用户只看到「未能提取标题」，根本不知道该做什么。
+    """
+    if _COOKIE_HINT_RE.search(detail or ""):
+        return (
+            "该站点需要浏览器 Cookie 才能解析（抖音/微博/小红书等常见）；"
+            "请在「链接解析」页设置 cookies.txt 路径"
+        )
+    return ""
+
+
 def _clean_display_url(url: str) -> str:
     """展示用地址：裁掉一堆分享/跟踪参数（``share_*`` / ``buvid`` / ``unique_k`` …）。
 
@@ -452,11 +495,13 @@ class LinkResolver:
         timeout: float = 20.0,
         failed_ttl: float = 600.0,
         logger: Callable[[str, str], None] | None = None,
+        cookies_file: str = "",
     ) -> None:
         self._cache: "OrderedDict[str, LinkInfo]" = OrderedDict()
         self._cache_size = max(1, int(cache_size))
         # 公开属性：引擎在配置热更新时会直接改写它。
         self.timeout = max(1.0, float(timeout))
+        self.cookies_file = usable_cookies_file(cookies_file)
         self._failed_ttl = max(0.0, float(failed_ttl))
         self._log = logger or (lambda level, message: None)
         self._lock = threading.Lock()
@@ -481,6 +526,18 @@ class LinkResolver:
             self._cache.move_to_end(info.url)
             while len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
+
+    def clear_failed_cache(self) -> int:
+        """丢掉所有**失败**的缓存条目，成功的不动；返回清掉的数量。
+
+        配置变化时用：比如刚给上 cookies.txt，之前因缺 Cookie 失败的链接
+        应该能立刻重试，而不是等 ``failed_ttl`` 过期或重启程序。
+        """
+        with self._lock:
+            stale = [url for url, info in self._cache.items() if not info.ok]
+            for url in stale:
+                self._cache.pop(url, None)
+        return len(stale)
 
     # -- 解析 ------------------------------------------------------------- #
 
@@ -559,11 +616,23 @@ class LinkResolver:
         if expand_error:
             return LinkInfo(url=url, ok=False, error=expand_error)
         lookup = target or url
+        ytdlp_info: LinkInfo | None = None
         if module is not None:
-            info = self._extract_with_ytdlp(module, lookup)
-            if info.ok:
-                return _rekey(info, url, lookup)
-        return _rekey(self._fetch_page(lookup), url, lookup)
+            ytdlp_info = self._extract_with_ytdlp(module, lookup)
+            if ytdlp_info.ok:
+                return _rekey(ytdlp_info, url, lookup)
+        page_info = self._fetch_page(lookup)
+        if page_info.ok:
+            return _rekey(page_info, url, lookup)
+        if ytdlp_info is not None and ytdlp_info.error:
+            # 两条路都失败时以 yt-dlp 的原因为主：它的报错通常更具体
+            # （例如明确说「需要 Cookie」），而网页兜底只会说「未能提取标题」。
+            # 网页兜底的原因不同就附在后面，避免丢信息。
+            detail = ytdlp_info.error
+            if page_info.error and page_info.error != detail:
+                detail = f"{detail}（网页兜底：{page_info.error}）"
+            page_info.error = detail
+        return _rekey(page_info, url, lookup)
 
     def _extract_with_ytdlp(self, module: Any, url: str) -> LinkInfo:
         options = {
@@ -576,11 +645,19 @@ class LinkResolver:
             "cachedir": False,
             "logger": _QuietLogger(),
         }
+        if self.cookies_file:
+            options["cookiefile"] = self.cookies_file
         try:
             with module.YoutubeDL(options) as ydl:
                 data = ydl.extract_info(url, download=False)
         except Exception as exc:  # yt-dlp 抛出的异常类型很多，统一兜住
-            return LinkInfo(url=url, ok=False, error=_short(exc))
+            detail = _short(exc)
+            hint = _cookie_hint(detail)
+            return LinkInfo(
+                url=url,
+                ok=False,
+                error=f"{detail}｜{hint}" if hint else detail,
+            )
         if not isinstance(data, dict):
             return LinkInfo(url=url, ok=False, error="无法解析该链接")
         if data.get("_type") == "playlist":
@@ -705,6 +782,8 @@ class LinkResolver:
             options["ffmpeg_location"] = ffmpeg
         if max_mb > 0:
             options["max_filesize"] = max_mb * 1024 * 1024
+        if self.cookies_file:
+            options["cookiefile"] = self.cookies_file
 
         try:
             with module.YoutubeDL(options) as ydl:
@@ -713,6 +792,9 @@ class LinkResolver:
             detail = _short(exc)
             if not ffmpeg and "format is not available" in detail.lower():
                 detail += "（该站点只提供分离音视频流，需要 ffmpeg 合流）"
+            hint = _cookie_hint(detail)
+            if hint:
+                detail += f"｜{hint}"
             self._log("warning", f"下载链接内容失败 {url}：{detail}")
             return None
 

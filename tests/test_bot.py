@@ -2360,6 +2360,9 @@ class LinkConfigTests(unittest.TestCase):
         cfg = BotConfig()
         self.assertTrue(cfg.link_parse_enabled)
         self.assertEqual(cfg.link_parse_max, 3)
+        self.assertEqual(cfg.link_parse_timeout, 20.0)
+        # 默认不带 Cookie：需要 Cookie 的站点（抖音等）会解析失败并给出提示。
+        self.assertEqual(cfg.link_cookies_file, "")
         self.assertFalse(cfg.link_download_enabled)
         self.assertEqual(cfg.link_download_max, 1)
         self.assertEqual(cfg.link_download_max_mb, 100)
@@ -2386,10 +2389,12 @@ class LinkConfigTests(unittest.TestCase):
                 "link_download_max_mb": -5,
                 "link_download_quota_mb": -7,
                 "link_download_dir": "   ",
+                "link_cookies_file": "   ",
             }
         )
         self.assertEqual(cfg.link_parse_max, 0)
         self.assertEqual(cfg.link_parse_timeout, 1.0)
+        self.assertEqual(cfg.link_cookies_file, "")
         self.assertEqual(cfg.link_download_max, 0)
         self.assertEqual(cfg.link_download_max_mb, 0)
         # 0 表示「不限制」，负数一律归零而不是回落到默认值。
@@ -2401,6 +2406,185 @@ class LinkConfigTests(unittest.TestCase):
         self.assertTrue(str(BotConfig().download_dir()).endswith("downloads"))
         cfg = BotConfig.from_dict({"link_download_dir": tempfile.gettempdir()})
         self.assertEqual(cfg.download_dir(), Path(tempfile.gettempdir()))
+
+
+class LinkCookiesTests(unittest.TestCase):
+    """cookies.txt 支持：路径规整、失败提示、缓存清理、传给 yt-dlp。"""
+
+    @staticmethod
+    def _write_cookies(directory, name="cookies.txt") -> Path:
+        path = Path(directory) / name
+        path.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+        return path
+
+    def test_usable_cookies_file_rejects_invalid_input(self):
+        self.assertEqual(links_mod.usable_cookies_file(""), "")
+        self.assertEqual(links_mod.usable_cookies_file("   "), "")
+        self.assertEqual(links_mod.usable_cookies_file(None), "")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                links_mod.usable_cookies_file(os.path.join(tmp, "nope.txt")), ""
+            )
+            # 目录不是文件：交给 yt-dlp 会让整条提取都失败，必须挡住。
+            self.assertEqual(links_mod.usable_cookies_file(tmp), "")
+            # 空文件同样无效（常见于「导出失败」留下的空壳）。
+            empty = Path(tmp) / "empty.txt"
+            empty.write_text("", encoding="utf-8")
+            self.assertEqual(links_mod.usable_cookies_file(str(empty)), "")
+
+    def test_usable_cookies_file_returns_absolute_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_cookies(tmp)
+            self.assertEqual(links_mod.usable_cookies_file(str(path)), str(path))
+            # 从界面粘贴进来的首尾空白与引号要能剥掉。
+            self.assertEqual(
+                links_mod.usable_cookies_file(f'  "{path}"  '), str(path)
+            )
+
+    def test_cookie_hint_translates_cookie_errors(self):
+        for detail in (
+            "Failed to download web detail JSON: HTTP Error 403: Forbidden; "
+            "fresh cookies (not necessarily logged in) are needed",
+            "Failed to decrypt with DPAPI",
+            "Sign in to confirm you're not a bot",
+            "cookies are required",
+        ):
+            self.assertTrue(links_mod._cookie_hint(detail), detail)
+        # 普通失败不该被误报成「需要 Cookie」。
+        self.assertEqual(links_mod._cookie_hint("Unable to extract"), "")
+        self.assertEqual(links_mod._cookie_hint(""), "")
+
+    def test_clear_failed_cache_keeps_successful_entries(self):
+        resolver = links_mod.LinkResolver()
+        resolver._store(LinkInfo(url="https://a", ok=True, title="好的"))
+        resolver._store(LinkInfo(url="https://b", ok=False, error="HTTP 403"))
+        self.assertEqual(resolver.clear_failed_cache(), 1)
+        self.assertIsNotNone(resolver.cached("https://a"))
+        self.assertIsNone(resolver.cached("https://b"))
+        self.assertEqual(resolver.clear_failed_cache(), 0)
+
+    def test_init_normalizes_cookies_file(self):
+        self.assertEqual(links_mod.LinkResolver().cookies_file, "")
+        self.assertEqual(
+            links_mod.LinkResolver(cookies_file="/no/such/file.txt").cookies_file, ""
+        )
+
+    # -- 传给 yt-dlp ------------------------------------------------------ #
+
+    @staticmethod
+    def _capturing_module(captured, result=None, boom=None):
+        class FakeYDL:
+            def __init__(self, options):
+                captured.update(options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=False):
+                if boom is not None:
+                    raise boom
+                return result if result is not None else {}
+
+        class FakeModule:
+            YoutubeDL = FakeYDL
+
+        return FakeModule
+
+    def test_extract_passes_cookiefile(self):
+        captured: dict = {}
+        module = self._capturing_module(
+            captured, result={"title": "视频", "extractor_key": "Test"}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_cookies(tmp)
+            info = links_mod.LinkResolver(cookies_file=str(path))._extract_with_ytdlp(
+                module, "https://x"
+            )
+        self.assertTrue(info.ok)
+        self.assertEqual(captured["cookiefile"], str(path))
+
+    def test_extract_omits_cookiefile_when_unset(self):
+        captured: dict = {}
+        module = self._capturing_module(
+            captured, result={"title": "视频", "extractor_key": "Test"}
+        )
+        links_mod.LinkResolver()._extract_with_ytdlp(module, "https://x")
+        self.assertNotIn("cookiefile", captured)
+
+    def test_extract_error_appends_cookie_hint(self):
+        captured: dict = {}
+        module = self._capturing_module(
+            captured,
+            boom=RuntimeError(
+                "Failed to download web detail JSON: HTTP Error 403: Forbidden; "
+                "fresh cookies (not necessarily logged in) are needed"
+            ),
+        )
+        info = links_mod.LinkResolver()._extract_with_ytdlp(module, "https://x")
+        self.assertFalse(info.ok)
+        self.assertIn("Cookie", info.error)
+
+    def test_download_passes_cookiefile(self):
+        captured: dict = {}
+        module = self._capturing_module(captured, result={})
+        original = links_mod.load_yt_dlp
+        links_mod.load_yt_dlp = lambda: module
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = self._write_cookies(tmp)
+                links_mod.LinkResolver(cookies_file=str(path))._download_sync(
+                    "https://x", tmp, 0
+                )
+                self.assertEqual(captured["cookiefile"], str(path))
+        finally:
+            links_mod.load_yt_dlp = original
+
+    def test_engine_update_config_hot_swaps_cookies(self):
+        """换了 cookies.txt 要立刻生效，并清掉之前因缺 Cookie 的失败缓存。"""
+        engine = BotEngine(
+            FakeAdapter(), BotConfig(enabled=True), llm_factory=lambda c: FakeLLM(c)
+        )
+        engine._links._store(LinkInfo(url="https://b", ok=False, error="HTTP 403"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_cookies(tmp)
+            engine.update_config(
+                BotConfig(enabled=True, link_cookies_file=str(path))
+            )
+            self.assertEqual(engine._links.cookies_file, str(path))
+            self.assertIsNone(engine._links.cached("https://b"))
+
+    def test_engine_update_config_clears_cookies_when_path_invalid(self):
+        engine = BotEngine(
+            FakeAdapter(), BotConfig(enabled=True), llm_factory=lambda c: FakeLLM(c)
+        )
+        engine._links.cookies_file = "/tmp/old.txt"
+        engine.update_config(BotConfig(enabled=True, link_cookies_file="/no/such.txt"))
+        self.assertEqual(engine._links.cookies_file, "")
+
+    def test_resolve_sync_keeps_ytdlp_reason_when_page_fallback_fails(self):
+        """两条路都失败时要保留 yt-dlp 的具体原因，否则用户只看到「未能提取标题」。"""
+        module = self._capturing_module(
+            {},
+            boom=RuntimeError(
+                "Fresh cookies (not necessarily logged in) are needed"
+            ),
+        )
+        original = links_mod.load_yt_dlp
+        links_mod.load_yt_dlp = lambda: module
+        try:
+            resolver = links_mod.LinkResolver()
+            resolver._fetch_page = lambda url: LinkInfo(
+                url=url, ok=False, error="未能提取标题"
+            )
+            info = resolver._resolve_sync("https://example.com/v")
+        finally:
+            links_mod.load_yt_dlp = original
+        self.assertFalse(info.ok)
+        self.assertIn("Fresh cookies", info.error)
+        self.assertIn("未能提取标题", info.error)
 
 
 class LinkEngineTests(unittest.IsolatedAsyncioTestCase):

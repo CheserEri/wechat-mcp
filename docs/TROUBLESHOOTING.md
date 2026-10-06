@@ -108,8 +108,17 @@
 
 - `--selfcheck` 里 `yt_dlp_version` 显示 `(不可用)`：内置 yt-dlp 导入失败，
   其下方会给出 `yt_dlp_error`（冻结包缺标准库子模块的典型症状）。
-- 媒体站点（B 站 / YouTube 等）解析不出标题：确认网络可达，且该站需要登录时
-  在 `cookies` 层面另行处理；普通网页会自动回退到抓取 `<title>`。
+- 媒体站点（B 站 / YouTube 等）解析不出标题：确认网络可达；普通网页会自动回退到抓取 `<title>`。
+- **抖音 / 微博 / 小红书解析失败（错误里带 `fresh cookies ... are needed` 或 `HTTP 403`）**：
+  这些站点的网页是空壳、接口要求带 Cookie，必须提供一份 **cookies.txt**。
+  在「链接解析」页把路径填到 **cookies.txt 路径**（留空 = 不使用），保存后立即生效
+  （会清掉之前失败的解析缓存，可直接重发链接重试）。
+  - **怎么拿到 cookies.txt**：在 Chrome / Edge 里**登录对应网站**，装一个导出扩展
+    （如 *Get cookies.txt LOCALLY*），在目标站点页面上导出 **Netscape 格式**的
+    `cookies.txt` 即可——文件名与格式都必须是 Netscape（`# Netscape HTTP Cookie File` 开头）。
+  - **不必登录**也能导出（yt-dlp 原话是 `not necessarily logged in`），但很多站点会持续校验，
+    **登录后导出更稳**；导出的文件有过期时间，失效后重新导一次。
+  - 路径填错、指向目录、或文件是空的，程序会**当成没填**（不报错），继续走匿名请求。
 - **下载**音视频失败：DASH 分离流必须靠 ffmpeg 合流，`--selfcheck` 的 `ffmpeg`
   必须可用（打包版已内置 `imageio_ffmpeg` 自带的 ffmpeg）。
 - 「下载并回发」默认关闭；开启后下载目录会被自动纳入发送白名单，否则回发会被

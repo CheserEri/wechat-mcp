@@ -28,7 +28,7 @@ from ..adapters.deepseekgirl import DeepSeekGirlAdapter
 from ..schemas import MessageRecord
 from .config import BotConfig
 from . import storage, tweet
-from .links import LinkResolver, extract_urls, format_link_block
+from .links import LinkResolver, extract_urls, format_link_block, usable_cookies_file
 from .llm import LLMClient, LLMError
 from .persona import get_persona
 
@@ -172,6 +172,7 @@ class BotEngine:
             cache_size=256,
             timeout=self._config.link_parse_timeout,
             logger=self._log,
+            cookies_file=self._config.link_cookies_file,
         )
         # 「下载并回发」在后台执行：大视频要下几分钟，而 _consume 串行消费队列，
         # 若在 _handle 里 await 会把后续消息全卡住。这里跟踪在跑的任务与 URL，
@@ -197,6 +198,16 @@ class BotEngine:
         self._config = config
         # 解析超时随配置热更新；缓存保留，避免重复解析。
         self._links.timeout = config.link_parse_timeout
+        # cookies.txt 换了路径要立刻生效：清掉失败缓存，让之前因缺 Cookie
+        # 失败的链接可以马上重试，不用等 TTL 过期或重启程序。
+        cookies_file = usable_cookies_file(config.link_cookies_file)
+        if cookies_file != self._links.cookies_file:
+            self._links.cookies_file = cookies_file
+            self._links.clear_failed_cache()
+            if cookies_file:
+                self._log("info", f"已启用链接解析 Cookie：{cookies_file}")
+            else:
+                self._log("info", "已停用链接解析 Cookie（cookies.txt 未设置或不可读）。")
 
     # ------------------------------------------------------------------ 启停
 

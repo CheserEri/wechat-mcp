@@ -111,6 +111,10 @@ class BotConfig:
     link_parse_max: int = 3
     # 单个链接的解析超时（秒）。
     link_parse_timeout: float = 20.0
+    # Netscape 格式 cookies.txt 的路径（留空 = 不使用）。
+    # 抖音、微博、小红书等站点会对未带 Cookie 的请求返回 403，yt-dlp 明确要求
+    # 「新鲜 cookie（不必登录）」；用浏览器扩展导出一次 cookies.txt 填到这里即可。
+    link_cookies_file: str = ""
     # 下载音视频并发回当前聊天。默认**关闭**：会向真实聊天发送文件。
     link_download_enabled: bool = False
     # 单次触发最多下载几个链接。
@@ -201,6 +205,7 @@ class BotConfig:
         config.link_parse_enabled = bool(config.link_parse_enabled)
         config.link_parse_max = max(0, int(config.link_parse_max))
         config.link_parse_timeout = max(1.0, float(config.link_parse_timeout))
+        config.link_cookies_file = str(config.link_cookies_file or "").strip()
         config.link_download_enabled = bool(config.link_download_enabled)
         config.link_download_max = max(0, int(config.link_download_max))
         config.link_download_dir = str(config.link_download_dir or "").strip()
