@@ -1935,45 +1935,42 @@ class BridgeFileSendConfirmTests(unittest.TestCase):
             self.assertFalse(bridge._send_file_sync("群聊", self._tmp_file(tmp)))
         self.assertEqual(calls["n"], 1, "落库未确认时不得重发（会重复发送）")
 
-    def test_refuses_oversize_attachment_without_attempting(self):
-        """超过微信单文件上限 → 动手前就拒发，一次 SendFiles 都不该调用。
-
-        微信对超限文件是弹「文件过大」直接拒收，而粘贴路线下这个拒收不会
-        变成异常/失败返回值。白试一轮只会占着发送闸门几十秒。
-        """
+    def test_large_attachment_warns_but_still_attempts(self):
+        """大附件只告警、**不拦截**——微信上限随会话类型变化（自聊可达 10 GB），
+        拦掉一个本来发得出去的文件比白试一轮更糟。"""
         module = self._module()
-        fake = _FakeWxDb(seq=100, new=[])
+        fake = _FakeWxDb(seq=100, new=[{"sender_id": 2, "type": "视频", "sort_seq": 101}])
         wx, calls = self._counting_wx(module, [None], fake)
         bridge = self._bridge(module, wx)
-        bridge.FILE_SEND_SIZE_LIMIT_MB = 1
+        bridge.FILE_SEND_SIZE_WARN_MB = 1
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "big.mp4"
             target.write_bytes(b"x" * (1024 * 1024 + 1))  # 略超 1 MB
-            self.assertFalse(bridge._send_file_sync("群聊", str(target)))
-        self.assertEqual(calls["n"], 0, "超限文件不应尝试发送")
+            self.assertTrue(bridge._send_file_sync("群聊", str(target)))
+        self.assertEqual(calls["n"], 1, "大附件仍然要真的尝试发送")
 
-    def test_oversize_reason_allows_sendable_file(self):
-        """正常体积返回空串（可发送）；0 表示不做限制。"""
+    def test_oversize_hint_empty_for_sendable_file(self):
+        """正常体积返回空串（不告警）；0 表示不打这条告警。"""
         module = self._module()
         bridge = self._bridge(module, SimpleNamespace(_db=None))
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "small.mp4"
             target.write_bytes(b"x" * 1024)
-            self.assertEqual(bridge._oversize_reason(str(target)), "")
-            bridge.FILE_SEND_SIZE_LIMIT_MB = 0
-            self.assertEqual(bridge._oversize_reason(str(target)), "")
+            self.assertEqual(bridge._oversize_hint(str(target)), "")
+            bridge.FILE_SEND_SIZE_WARN_MB = 0
+            self.assertEqual(bridge._oversize_hint(str(target)), "")
 
-    def test_oversize_reason_reports_size(self):
-        """超限时原因里要带上实际体积与上限，便于直接看懂日志。"""
+    def test_oversize_hint_reports_size(self):
+        """告警里要带上实际体积与参考值，便于直接看懂日志。"""
         module = self._module()
         bridge = self._bridge(module, SimpleNamespace(_db=None))
-        bridge.FILE_SEND_SIZE_LIMIT_MB = 1
+        bridge.FILE_SEND_SIZE_WARN_MB = 1
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "big.mp4"
             target.write_bytes(b"x" * (2 * 1024 * 1024))
-            reason = bridge._oversize_reason(str(target))
-        self.assertIn("2.0 MB", reason)
-        self.assertIn("1 MB", reason)
+            hint = bridge._oversize_hint(str(target))
+        self.assertIn("2.0 MB", hint)
+        self.assertIn("1 MB", hint)
 
 
 class _FakeGui:
