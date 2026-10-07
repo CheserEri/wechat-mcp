@@ -38,14 +38,17 @@ function bindDraftToControls() {
       if (label) label.textContent = fmtRange(draft[key]);
     }
 
-    el.addEventListener("input", () => {
+    const onEdit = () => {
       if (el.type === "checkbox") draft[key] = el.checked;
       else if (el.type === "range") {
         draft[key] = parseFloat(el.value);
         const label = rangeLabel(el);
         if (label) label.textContent = fmtRange(el.value);
       } else draft[key] = el.value;
-    });
+    };
+    el.addEventListener("input", onEdit);
+    // <select> 在部分 WebView 上不派发 input，补一个 change 兜住。
+    if (el.tagName === "SELECT") el.addEventListener("change", onEdit);
   });
 
   // 作用范围 segmented

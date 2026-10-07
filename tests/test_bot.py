@@ -71,6 +71,8 @@ class FakeAdapter:
         self.config = None
         # 引擎推过来的「发送失败后重试次数」（未推送时为 None）。
         self.send_attempts = None
+        # 引擎推过来的「附件发送路线」（未推送时为 None）。
+        self.file_send_mode = None
 
     def add_message_listener(self, listener):
         self.listeners.append(listener)
@@ -103,6 +105,10 @@ class FakeAdapter:
     def apply_send_attempts(self, attempts):
         """记录引擎推过来的「发送失败后重试次数」。"""
         self.send_attempts = int(attempts)
+
+    def apply_file_send_mode(self, mode):
+        """记录引擎推过来的「附件发送路线」。"""
+        self.file_send_mode = str(mode)
 
     async def pump(self):
         # 等待消费循环处理完队列；留足余量避免调度抖动导致的偶发失败。
@@ -2050,7 +2056,7 @@ class _FakeGui:
     """只实现 `_strict_input_box` 用到的那几个方法。"""
 
     def __init__(self, boxes):
-        """``boxes`` 是 ``_probe_input_box`` 依次返回的值（None 表示探测失败）。"""
+        """``boxes`` 是像素探测依次返回的值（None 表示探测失败）。"""
         self._boxes = list(boxes)
         self.probe_calls = 0
         self.recalibrated = 0
@@ -2062,6 +2068,10 @@ class _FakeGui:
             return None
         value = self._boxes.pop(0)
         return value
+
+    def _get_uia(self):
+        """模拟「UIA 不可用」——本类专测像素兜底那条路。"""
+        return None
 
     def _update_render_rect(self):
         pass
@@ -2088,9 +2098,14 @@ class StrictInputBoxTests(unittest.TestCase):
         self.module = self._module()
         self._old_interval = self.module._INPUT_BOX_PROBE_INTERVAL
         self.module._INPUT_BOX_PROBE_INTERVAL = 0.0
+        # 像素兜底换成「按序列返回」的假实现，让本类只关心重试/重校准逻辑；
+        # 真正的像素探测由 PixelInputBoxProbeTests 覆盖。
+        self._old_probe = self.module._probe_input_box_rightside
+        self.module._probe_input_box_rightside = lambda gui: gui._probe_input_box()
 
     def tearDown(self):
         self.module._INPUT_BOX_PROBE_INTERVAL = self._old_interval
+        self.module._probe_input_box_rightside = self._old_probe
 
     def test_returns_box_when_probe_succeeds(self):
         gui = _FakeGui([None, (10, 20, 30, 40)])
@@ -2117,6 +2132,533 @@ class StrictInputBoxTests(unittest.TestCase):
         self.assertIsNone(self.module._strict_input_box(gui))
         self.module._strict_input_box(gui)
         self.assertEqual(gui.recalibrated, 1, "第二次调用不应再次校准")
+
+
+class _Rect:
+    """UIA 的 ``BoundingRectangle``。"""
+
+    def __init__(self, left, top, right, bottom):
+        self.left, self.top, self.right, self.bottom = left, top, right, bottom
+
+
+class _FakeUia:
+    """只实现 UIA 取输入框 / 点击用到的那两个方法。"""
+
+    def __init__(self, rect=None, clicks=None):
+        self._win = object()
+        self._rect = rect
+        self._clicks = clicks if clicks is not None else []
+        self.chat_input_calls = 0
+
+    def _chat_input(self, win=None):
+        self.chat_input_calls += 1
+        if self._rect is None:
+            return None
+        return SimpleNamespace(BoundingRectangle=self._rect)
+
+    def _click_at(self, x, y, right=False):
+        self._clicks.append((x, y))
+
+
+class UiaInputBoxTests(unittest.TestCase):
+    """输入框定位优先走 UIA：矩形精确、不需要截屏。
+
+    回归点：像素探测依赖 ``right_pane_left``（= ``sidebar_ratio * render_w``），
+    而 ``sidebar_ratio`` 可能是 ``calibrate_layout()`` 失败后**静默回落**的默认值
+    0.22，于是探测必然失败；UIA 的 ``mmui::ChatInputField`` 矩形不受此影响，
+    窗口缩在托盘里也照样有值。
+    """
+
+    @staticmethod
+    def _module():
+        return BridgeFileSendConfirmTests._module()
+
+    def _gui(self, uia):
+        return SimpleNamespace(
+            _get_uia=lambda: uia, origin_x=100, origin_y=50,
+            _update_render_rect=lambda: None,
+        )
+
+    def test_converts_absolute_rect_to_render_relative(self):
+        module = self._module()
+        uia = _FakeUia(_Rect(300, 400, 1300, 700))
+        box = module._uia_input_box(self._gui(uia))
+        self.assertEqual(box, (200, 350, 1200, 650))
+
+    def test_rejects_degenerate_rects(self):
+        """太小的矩形不是输入框（多半是别的 Edit）。"""
+        module = self._module()
+        for rect in (_Rect(0, 0, 40, 700), _Rect(0, 0, 900, 20)):
+            with self.subTest(rect=(rect.left, rect.top, rect.right, rect.bottom)):
+                self.assertIsNone(module._uia_input_box(self._gui(_FakeUia(rect))))
+
+    def test_returns_none_when_uia_unavailable(self):
+        module = self._module()
+        self.assertIsNone(module._uia_input_box(self._gui(None)))
+        self.assertIsNone(module._uia_input_box(self._gui(_FakeUia(None))))
+
+    def test_failure_is_backed_off(self):
+        """UIA 层不可用时冷却一段时间，别在热路径上反复付超时代价。"""
+        module = self._module()
+        calls = {"n": 0}
+
+        def broken():
+            calls["n"] += 1
+            raise RuntimeError("UIA 未初始化")
+
+        gui = SimpleNamespace(_get_uia=broken)
+        self.assertIsNone(module._uia_input_box(gui))
+        self.assertGreater(module._uia_input_box_disabled_until, time.time())
+        self.assertIsNone(module._uia_input_box(gui))
+        self.assertEqual(calls["n"], 1, "冷却期内不应再次调用 UIA")
+
+    def test_strict_input_box_prefers_uia(self):
+        """UIA 拿到值就不必再截屏探测。"""
+        module = self._module()
+        module._INPUT_BOX_PROBE_INTERVAL = 0.0
+        probed = {"n": 0}
+
+        def probe(_gui):
+            probed["n"] += 1
+            return None
+
+        module._probe_input_box_rightside = probe
+        uia = _FakeUia(_Rect(300, 400, 1300, 700))
+        box = module._strict_input_box(self._gui(uia))
+        self.assertEqual(box, (200, 350, 1200, 650))
+        self.assertEqual(probed["n"], 0, "UIA 成功时不该走像素兜底")
+
+
+class _PixelGui:
+    """合成一块「微信界面」用于像素探测。
+
+    左半是会话列表（灰 ``(238,238,240)``），右半是聊天区（白）；下半是输入框，
+    顶边有一条 ``divider`` px 的浅灰分界线——与真实界面同构。
+    """
+
+    def __init__(
+        self,
+        render_w=1000,
+        render_h=800,
+        origin_x=0,
+        origin_y=0,
+        right_pane_left=0,
+        input_top=520,
+        divider=2,
+        msg_left=500,
+    ):
+        self.render_w = render_w
+        self.render_h = render_h
+        self.origin_x = origin_x
+        self.origin_y = origin_y
+        self.right_pane_left = right_pane_left
+        self.input_top = input_top
+        self.divider = divider
+        self.msg_left = msg_left
+        self.boxes: list[tuple] = []
+
+    def _grab_screen(self, box=None):
+        from PIL import Image
+
+        self.boxes.append(box)
+        x0, y0, x1, y1 = box
+        width, height = max(1, x1 - x0), max(1, y1 - y0)
+        img = Image.new("RGB", (width, height), (255, 255, 255))
+        px = img.load()
+        for yy in range(height):
+            ay = y0 + yy
+            if ay >= self.input_top:
+                band = "box"
+            elif ay >= self.input_top - self.divider:
+                band = "divider"
+            else:
+                band = "message"
+            for xx in range(width):
+                ax = x0 + xx
+                if ax < self.msg_left:
+                    px[xx, yy] = (238, 238, 240)
+                elif band == "divider":
+                    px[xx, yy] = (224, 224, 224)
+                else:
+                    px[xx, yy] = (255, 255, 255)
+        return img
+
+
+class PixelInputBoxProbeTests(unittest.TestCase):
+    """像素兜底：探测行**从右半侧起扫**，不依赖可能是默认值的 ``sidebar_ratio``。
+
+    回归点（0.8.9 实测）：本机 ``layout-*.json`` 里 ``sidebar_ratio: 0.22``
+    正好等于模块默认常量（``calibrate_layout()`` 的「搜索」OCR 锚点失败后静默
+    回落），而真值 ≈0.384。按 0.22 起扫会多扫进 274px 会话列表底色
+    ``(238,238,240)``，把白度从 **0.988 压到 0.782**，正好卡在 0.80 阈值之下，
+    探测必然失败——日志里刷屏的「输入框定位失败」就是这么来的。
+    """
+
+    @staticmethod
+    def _module():
+        return BridgeFileSendConfirmTests._module()
+
+    def test_returns_none_without_render_size(self):
+        module = self._module()
+        self.assertIsNone(module._probe_input_box_rightside(_PixelGui(render_w=0)))
+        self.assertIsNone(module._probe_input_box_rightside(_PixelGui(render_h=0)))
+
+    def test_ignores_uncalibrated_sidebar_ratio(self):
+        """``right_pane_left`` 是默认值 0 / 0.22 时也必须能定位成功。"""
+        module = self._module()
+        for pane_left in (0, 220):
+            with self.subTest(right_pane_left=pane_left):
+                gui = _PixelGui(right_pane_left=pane_left)
+                box = module._probe_input_box_rightside(gui)
+                self.assertEqual(box, (500, 520, 1000, 680))
+                # 第一个探测行必须从右半侧起扫（x=500），绝不落进会话列表。
+                self.assertEqual(gui.boxes[0][0], 500)
+
+    def test_requires_a_thin_divider_above(self):
+        """顶边上方必须是 1-4px 细灰分界线，否则判为渲染未稳定。"""
+        module = self._module()
+        # 输入框顶边低到探测行之外 → 竖扫碰不到分界线 → 失败。
+        self.assertIsNone(
+            module._probe_input_box_rightside(_PixelGui(input_top=790))
+        )
+
+    def test_grey_row_is_rejected(self):
+        """探测行整行不白（例如落在会话列表上）→ 该行作废，探测失败。"""
+        module = self._module()
+        self.assertIsNone(
+            module._probe_input_box_rightside(_PixelGui(msg_left=1000))
+        )
+
+
+class PrivateUser32Tests(unittest.TestCase):
+    """Win32 消息层用**私有** user32 句柄，绝不污染 wechatauto 的共享单例。
+
+    回归点：``ctypes.windll.user32`` 在进程内是同一个对象，wechatauto 也显式设过
+    ``SendMessageW.argtypes``。若我们改它的签名，会连带改掉 wechatauto 自己的
+    调用，属于极难排查的相互污染。
+    """
+
+    @staticmethod
+    def _module():
+        return BridgeFileSendConfirmTests._module()
+
+    def test_hwnd_int_normalises_callback_arguments(self):
+        import ctypes
+
+        module = self._module()
+        self.assertEqual(module._hwnd_int(None), 0)
+        self.assertEqual(module._hwnd_int(1234), 1234)
+        self.assertEqual(module._hwnd_int(ctypes.c_void_p(5678)), 5678)
+
+    def test_dialog_lookup_filters_by_process(self):
+        """``#32770`` + 「打开」是通用对话框的长相，别的程序也有——必须按进程过滤。
+
+        回归点：本机实测撞到微信自己的「选择文件」对话框还开着（上一次手工测试
+        留下的），说明这类窗口确实会残留；不过滤进程就可能把文件路径填进**别人**
+        的对话框。PID 0 属于「系统空闲进程」，永远不会有窗口。
+        """
+        module = self._module()
+        self.assertEqual(module._find_file_dialog({0}), 0)
+
+    def test_wechat_pids_collects_window_and_gui_pids(self):
+        module = self._module()
+        bridge = object.__new__(module.WeChatBridge)
+        bridge._window_process_ids = {11, 22}
+        self.assertEqual(
+            bridge._wechat_pids(SimpleNamespace(pid=33)), {11, 22, 33}
+        )
+        bridge._window_process_ids = set()
+        self.assertEqual(bridge._wechat_pids(SimpleNamespace()), set())
+
+    def test_private_handle_is_cached_and_distinct(self):
+        import ctypes
+
+        module = self._module()
+        shared = ctypes.windll.user32
+        before = shared.SendMessageW.argtypes
+        first = module._user32()
+        self.assertIs(first, module._user32(), "应缓存同一个句柄")
+        self.assertIsNot(first, shared, "必须是独立句柄")
+        self.assertEqual(
+            shared.SendMessageW.argtypes, before,
+            "不得改动共享单例的函数签名",
+        )
+
+    def test_ensure_visible_fails_open_without_hwnd(self):
+        """拿不到句柄时判断不了 → 不阻断发送（返回 True）。"""
+        module = self._module()
+        self.assertTrue(module._ensure_wechat_visible(SimpleNamespace()))
+        self.assertTrue(
+            module._ensure_wechat_visible(SimpleNamespace(main_hwnd=0))
+        )
+
+    def test_ensure_visible_restores_a_hidden_window(self):
+        """主窗被缩到托盘（``IsWindowVisible`` 为假）→ 恢复显示后继续发送。
+
+        回归点（0.8.9 实测）：窗口隐藏时 ``GetWindowRect`` 仍返回完全正确的
+        矩形，但 ``ImageGrab.grab`` 抓到的是**别的程序的画面**，于是所有像素
+        判断一起失效——日志里刷屏的「输入框定位失败」就是这么来的。
+        """
+        try:
+            import win32gui
+        except ImportError:  # pragma: no cover - 缺 pywin32 时跳过
+            self.skipTest("缺少 pywin32")
+
+        module = self._module()
+        try:
+            hwnd = win32gui.CreateWindow(
+                "STATIC", "wechat-mcp-hidden-test", 0, 0, 0, 10, 10, 0, 0, 0, None
+            )
+        except Exception as exc:  # pragma: no cover - 桌面会话受限时跳过
+            self.skipTest(f"无法创建测试窗口: {exc}")
+        if not hwnd:  # pragma: no cover
+            self.skipTest("CreateWindow 返回 0")
+        try:
+            self.assertFalse(win32gui.IsWindowVisible(hwnd), "测试窗口应是隐藏的")
+            self.assertTrue(
+                module._ensure_wechat_visible(SimpleNamespace(main_hwnd=hwnd))
+            )
+            self.assertTrue(win32gui.IsWindowVisible(hwnd), "应已恢复显示")
+        finally:
+            try:
+                win32gui.DestroyWindow(hwnd)
+            except Exception:  # pragma: no cover
+                pass
+
+
+class _DialogRecorder:
+    """记录对话框路线每一步被调用的情况。"""
+
+    def __init__(self):
+        self.paths: list[tuple[int, str]] = []
+        self.closed: list[int] = []
+        self.clicks: list[tuple[int, int]] = []
+        self.opened: list[str] = []
+        self.enters = 0
+
+
+class FileDialogRouteTests(unittest.TestCase):
+    """原生「选择文件」对话框路线：UIA 点「发送文件」→ WM_SETTEXT 填路径 → 打开。
+
+    为什么值得单独一条路线：剪贴板路线要「探输入框（像素）→ 写 CF_HDROP →
+    等微信拷原始文件 → 按回车」，任何一步时序错位都会静默失败，而且依赖像素
+    探测，窗口一缩到托盘就全盘失效。这条路全程不碰像素，实测约 1 秒完成。
+    """
+
+    @staticmethod
+    def _module():
+        return BridgeFileSendConfirmTests._module()
+
+    def _build(
+        self,
+        *,
+        visible=True,
+        chat_open=True,
+        current_chat=None,
+        button=(10, 20),
+        dialog=4242,
+        edit=7,
+        text_ok=True,
+        ok_button=99,
+        confirmed=True,
+        nudged=True,
+        stale=0,
+    ):
+        module = self._module()
+        rec = _DialogRecorder()
+        module._ensure_wechat_visible = lambda gui: visible
+        module._uia_find_button_center = lambda uia, names: button
+        module._find_file_dialog = lambda *_a, **_k: stale
+        module._close_file_dialog = lambda h: rec.closed.append(h)
+        module._dialog_edit = lambda h: edit
+        module._dialog_child_by_id = lambda *a, **k: ok_button
+        module._click_dialog_control = lambda h: bool(h)
+
+        def set_text(hwnd, text):
+            rec.paths.append((hwnd, text))
+            return text_ok
+
+        module._set_dialog_text = set_text
+
+        def open_chat(who):
+            rec.opened.append(who)
+            return chat_open
+
+        uia = _FakeUia(clicks=rec.clicks)
+        gui = SimpleNamespace(
+            _get_uia=lambda: uia,
+            _current_chat=current_chat,
+            get_input_box=lambda: (0, 0, 10, 10),
+            _open_chat_and_settle=open_chat,
+        )
+        bridge = object.__new__(module.WeChatBridge)
+        bridge._backend = "wechatauto"
+        bridge._wx = SimpleNamespace(_gui=gui, _db=None)
+        bridge._wait_file_dialog = lambda *_a, **_k: dialog
+
+        def confirm(room, seq):
+            return confirmed
+
+        def nudge(room, seq):
+            rec.enters += 1
+            return nudged
+
+        bridge._confirm_file_sent = confirm
+        bridge._nudge_enter_until_confirmed = nudge
+        return module, bridge, rec
+
+    def test_happy_path_writes_path_and_confirms(self):
+        module, bridge, rec = self._build()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "clip.mp4"
+            target.write_bytes(b"x")
+            self.assertTrue(bridge._send_file_via_dialog("群聊", str(target)))
+        self.assertEqual(rec.opened, ["群聊"], "必须先切到目标会话")
+        self.assertEqual(rec.clicks, [(10, 20)], "应点「发送文件」按钮")
+        self.assertEqual(rec.paths, [(7, str(target))], "应把路径写进文件名输入框")
+        self.assertEqual(rec.enters, 0, "已确认时不该补按回车")
+
+    def test_opens_target_chat_before_clicking(self):
+        """「发送文件」按钮只作用于当前会话，必须先切过去——否则会发错聊天。"""
+        module, bridge, rec = self._build(current_chat="别的群")
+        self.assertTrue(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.opened, ["群聊"])
+
+    def test_skips_open_when_already_on_target(self):
+        module, bridge, rec = self._build(current_chat="群聊")
+        self.assertTrue(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.opened, [], "已在目标会话时不必重复切换")
+        self.assertEqual(rec.clicks, [(10, 20)])
+
+    def test_gives_up_when_chat_cannot_be_opened(self):
+        module, bridge, rec = self._build(chat_open=False)
+        self.assertFalse(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.clicks, [], "切不到目标会话就不该点按钮")
+
+    def test_falls_back_to_public_open_chat(self):
+        """拿不到 ``_open_chat_and_settle`` 时退到公开的 ``open_chat``。"""
+        module, bridge, rec = self._build()
+        gui = bridge._wx._gui
+        del gui._open_chat_and_settle
+        opened = []
+        gui.open_chat = lambda who: (opened.append(who), True)[1]
+        self.assertTrue(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(opened, ["群聊"])
+
+    def test_gives_up_without_any_chat_opener(self):
+        module, bridge, rec = self._build()
+        del bridge._wx._gui._open_chat_and_settle
+        self.assertFalse(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.clicks, [])
+
+    def test_reopens_when_input_box_is_missing(self):
+        """``_current_chat`` 是缓存值，输入框探不到就说明它已经过期。"""
+        module, bridge, rec = self._build(current_chat="群聊")
+        bridge._wx._gui.get_input_box = lambda: None
+        self.assertTrue(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.opened, ["群聊"])
+
+    def test_nudges_enter_when_not_confirmed(self):
+        """微信把附件放进输入框但没发出去 → 补按回车。"""
+        module, bridge, rec = self._build(confirmed=False, nudged=True)
+        self.assertTrue(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.enters, 1)
+
+    def test_reports_failure_when_nudge_also_fails(self):
+        module, bridge, rec = self._build(confirmed=False, nudged=False)
+        self.assertFalse(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.enters, 1)
+
+    def test_requires_visible_window(self):
+        module, bridge, rec = self._build(visible=False)
+        self.assertFalse(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.clicks, [], "窗口不可见时不该点击")
+
+    def test_gives_up_without_the_file_button(self):
+        module, bridge, rec = self._build(button=None)
+        self.assertFalse(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.paths, [])
+
+    def test_closes_stale_dialog_before_clicking(self):
+        module, bridge, rec = self._build(stale=777)
+        self.assertTrue(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.closed, [777])
+
+    def test_closes_dialog_when_path_cannot_be_written(self):
+        module, bridge, rec = self._build(text_ok=False)
+        self.assertFalse(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.closed, [4242], "写不进路径要关掉对话框收尾")
+
+    def test_closes_dialog_when_edit_is_missing(self):
+        module, bridge, rec = self._build(edit=0)
+        self.assertFalse(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.closed, [4242])
+
+    def test_gives_up_when_dialog_never_appears(self):
+        module, bridge, rec = self._build(dialog=0)
+        self.assertFalse(bridge._send_file_via_dialog("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(rec.paths, [])
+
+    # -- 与 _send_file_sync 的接线（路线开关） ------------------------------
+
+    def _sync_bridge(self, mode, *, dialog_ok=True, sends=None):
+        """造一个走 ``_send_file_sync`` 的桥，记录剪贴板路线是否被调用。"""
+        module, bridge, rec = self._build()
+        bridge.FILE_SEND_MODE = mode
+        called = {"dialog": 0, "clipboard": 0}
+
+        def via_dialog(room, path):
+            called["dialog"] += 1
+            return dialog_ok
+
+        def via_clipboard(room, path):
+            called["clipboard"] += 1
+            if sends is not None:
+                sends.append(path)
+            return True
+
+        bridge._send_file_via_dialog = via_dialog
+        bridge._send_file_via_clipboard = via_clipboard
+        return module, bridge, called
+
+    def test_auto_mode_falls_back_to_clipboard(self):
+        module, bridge, called = self._sync_bridge("auto", dialog_ok=False)
+        self.assertTrue(bridge._send_file_sync("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(called, {"dialog": 1, "clipboard": 1})
+
+    def test_auto_mode_skips_clipboard_when_dialog_works(self):
+        module, bridge, called = self._sync_bridge("auto", dialog_ok=True)
+        self.assertTrue(bridge._send_file_sync("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(called, {"dialog": 1, "clipboard": 0})
+
+    def test_dialog_only_mode_does_not_fall_back(self):
+        module, bridge, called = self._sync_bridge("dialog", dialog_ok=False)
+        self.assertFalse(bridge._send_file_sync("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(called, {"dialog": 1, "clipboard": 0})
+
+    def test_clipboard_only_mode_skips_dialog(self):
+        module, bridge, called = self._sync_bridge("clipboard")
+        self.assertTrue(bridge._send_file_sync("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(called, {"dialog": 0, "clipboard": 1})
+
+    def test_unknown_mode_is_treated_as_auto(self):
+        module, bridge, called = self._sync_bridge("bogus", dialog_ok=True)
+        self.assertTrue(bridge._send_file_sync("群聊", "C:/tmp/clip.mp4"))
+        self.assertEqual(called, {"dialog": 1, "clipboard": 0})
+
+    def test_apply_file_send_mode_normalises(self):
+        module, bridge, _rec = self._build()
+        for raw, expected in (
+            ("dialog", "dialog"),
+            (" DIALOG ", "dialog"),
+            ("clipboard", "clipboard"),
+            ("", "auto"),
+            (None, "auto"),
+            ("bogus", "auto"),
+        ):
+            with self.subTest(raw=raw):
+                bridge.apply_file_send_mode(raw)
+                self.assertEqual(bridge.FILE_SEND_MODE, expected)
 
 
 class _FakeWxDb:
@@ -3289,6 +3831,24 @@ class LinkConfigTests(unittest.TestCase):
         self.assertTrue(cfg.link_llm_followup)
         # 附件没发成功时默认再试 2 次。
         self.assertEqual(cfg.link_send_attempts, 2)
+        # 附件发送路线默认 auto：先试「发送文件」按钮，失败再退回剪贴板。
+        self.assertEqual(cfg.link_file_send_mode, "auto")
+
+    def test_file_send_mode_is_normalised(self):
+        """只认 auto/dialog/clipboard，其余（含旧配置缺失/大小写/空白）按 auto。"""
+        for raw, expected in (
+            ("dialog", "dialog"),
+            ("DIALOG", "dialog"),
+            ("  clipboard ", "clipboard"),
+            ("auto", "auto"),
+            ("", "auto"),
+            (None, "auto"),
+            ("bogus", "auto"),
+            ("sendfile", "auto"),
+        ):
+            with self.subTest(raw=raw):
+                cfg = BotConfig.from_dict({"link_file_send_mode": raw})
+                self.assertEqual(cfg.link_file_send_mode, expected)
 
     def test_ack_text_is_trimmed_and_newlines_collapsed(self):
         cfg = BotConfig.from_dict({"link_ack_text": "  正在\n解析  链接  "})
@@ -3371,6 +3931,50 @@ class SendAttemptsWiringTests(unittest.TestCase):
         self.assertTrue(
             any("重试次数" in line["message"] for line in engine.get_logs()),
             "应留下一条关于重试次数的警告",
+        )
+
+
+class FileSendModeWiringTests(unittest.TestCase):
+    """「附件发送路线」从配置推到适配层。"""
+
+    def test_pushed_on_engine_creation(self):
+        adapter = FakeAdapter()
+        BotEngine(adapter, BotConfig(link_file_send_mode="dialog"))
+        self.assertEqual(adapter.file_send_mode, "dialog")
+
+    def test_default_is_auto(self):
+        adapter = FakeAdapter()
+        BotEngine(adapter, BotConfig())
+        self.assertEqual(adapter.file_send_mode, "auto")
+
+    def test_pushed_on_config_update(self):
+        """界面保存配置后热更新，不必重启。"""
+        adapter = FakeAdapter()
+        engine = BotEngine(adapter, BotConfig(link_file_send_mode="auto"))
+        engine.update_config(BotConfig(link_file_send_mode="clipboard"))
+        self.assertEqual(adapter.file_send_mode, "clipboard")
+
+    def test_missing_method_is_tolerated(self):
+        """适配层没实现这个方法时不该拖垮启动或保存配置。"""
+
+        class BareAdapter:
+            pass
+
+        engine = BotEngine(BareAdapter(), BotConfig())
+        engine._push_file_send_mode()  # 不应抛异常
+
+    def test_failing_method_is_logged_not_raised(self):
+        """推送失败只记一条警告，不让配置保存整体失败。"""
+
+        class BrokenAdapter:
+            def apply_file_send_mode(self, mode):
+                raise RuntimeError("桥接层不在")
+
+        engine = BotEngine(BrokenAdapter(), BotConfig())
+        engine._push_file_send_mode()
+        self.assertTrue(
+            any("附件发送路线" in line["message"] for line in engine.get_logs()),
+            "应留下一条关于附件发送路线的警告",
         )
 
 

@@ -135,6 +135,13 @@ class BotConfig:
     #      所以**不会重复发送**。
     # 调大更耐折腾，代价是发送失败时占用发送闸门的时间更久。
     link_send_attempts: int = 2
+    # 附件发送路线（仅 wechatauto 后端生效）：
+    #   auto      先试原生「选择文件」对话框路线，失败再回退剪贴板粘贴（默认）；
+    #   dialog    只用对话框路线（失败即失败，不回退）；
+    #   clipboard 只用剪贴板粘贴路线（旧行为）。
+    # 对话框路线全程不截屏、不 OCR：按钮坐标来自 UIA，路径用 WM_SETTEXT 直接
+    # 写进系统对话框，实测约 1 秒完成，比像素+剪贴板路线更稳、更省。
+    link_file_send_mode: str = "auto"
     # X（Twitter）推文额外发一张本地渲染的卡片图（头像/昵称/正文/配图）。
     # 仅对 X 推文生效；推文含视频时还会下载视频一并回发。
     link_tweet_card_enabled: bool = True
@@ -222,6 +229,11 @@ class BotConfig:
         config.link_download_quota_mb = max(0, int(config.link_download_quota_mb))
         # 重试次数上限给到 10：再多也只是让发送闸门被占更久，收益递减。
         config.link_send_attempts = min(10, max(0, int(config.link_send_attempts)))
+        # 附件发送路线：只认三个合法值，其余一律按 auto（含旧配置文件没有这一项）。
+        _mode = str(getattr(config, "link_file_send_mode", "") or "").strip().lower()
+        config.link_file_send_mode = (
+            _mode if _mode in ("auto", "dialog", "clipboard") else "auto"
+        )
         config.link_tweet_card_enabled = bool(config.link_tweet_card_enabled)
         config.link_ack_enabled = bool(config.link_ack_enabled)
         # 文案留空即视为「不发提示」，故不做默认值回填（只去空白与换行）。

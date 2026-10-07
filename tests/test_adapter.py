@@ -46,6 +46,11 @@ class FakeBridge:
     # 桥接层用类常量控制「附件发送失败后的重试」，适配层会按配置覆盖。
     FILE_SEND_ATTEMPTS = 2
     FILE_SEND_ENTER_NUDGES = 2
+    # 附件发送路线（auto/dialog/clipboard），适配层会按配置覆盖。
+    FILE_SEND_MODE = "auto"
+
+    def apply_file_send_mode(self, mode: str) -> None:
+        self.FILE_SEND_MODE = mode
 
     def __init__(self) -> None:
         self.on_message = None
@@ -242,6 +247,41 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge.FILE_SEND_ENTER_NUDGES, 10)
         self.adapter.apply_send_attempts("坏值")
         self.assertEqual(self.bridge.FILE_SEND_ENTER_NUDGES, 10, "非法值应被忽略")
+
+    async def test_file_send_mode_is_applied_when_bridge_is_built(self):
+        """连接前设好的附件发送路线，建桥时要套用（重连后也不会丢）。"""
+        self.adapter.apply_file_send_mode("dialog")
+        await self.adapter.connect()
+        self.assertEqual(self.bridge.FILE_SEND_MODE, "dialog")
+
+    async def test_file_send_mode_is_applied_to_a_live_bridge(self):
+        """已连接时改配置要立刻生效。"""
+        await self.adapter.connect()
+        self.adapter.apply_file_send_mode("clipboard")
+        self.assertEqual(self.bridge.FILE_SEND_MODE, "clipboard")
+
+    async def test_file_send_mode_falls_back_to_auto(self):
+        """非法值（含旧配置文件里的空值）一律按 auto 处理。"""
+        await self.adapter.connect()
+        for bad in ("bogus", "", None, "DIALOG "):
+            with self.subTest(bad=bad):
+                self.adapter.apply_file_send_mode(bad)
+                expected = "dialog" if bad == "DIALOG " else "auto"
+                self.assertEqual(self.bridge.FILE_SEND_MODE, expected)
+
+    async def test_file_send_mode_tolerates_bridge_without_the_method(self):
+        """老桥接层没有 apply_file_send_mode 时退化成直接写属性，不抛异常。"""
+
+        class LegacyBridge:
+            FILE_SEND_MODE = "auto"
+
+        legacy = LegacyBridge()
+        self.adapter._bridge = legacy
+        self.adapter.apply_file_send_mode("dialog")
+        self.assertEqual(legacy.FILE_SEND_MODE, "dialog")
+        self.assertEqual(
+            LegacyBridge.FILE_SEND_MODE, "auto", "不该改到类属性上"
+        )
 
     async def test_dry_run_does_not_send(self):
         await self.adapter.connect()
