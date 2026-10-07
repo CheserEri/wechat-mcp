@@ -396,6 +396,93 @@ def _install_wechatauto_screenshot_compat() -> None:
     WeChatGUI._wechatbot_safe_screenshot = True
 
 
+def _install_wechatauto_input_box_guard() -> None:
+    """让 ``guia.get_input_box()`` 在探测失败时**真的**返回 ``None``。
+
+    wechatauto 的 ``get_input_box()`` 连续探测失败后会兜底返回一个按 ``render_h``
+    比例算出来的**猜测矩形**，**永不返回 None**；而它自己的 docstring 写的是
+    「探测失败返回 None（不再回退到默认布局，避免在错误坐标上误点）」。
+
+    库里的安全网**全部**建立在「失败返回 None」这个假设上，于是被这一个返回值
+    同时废掉：
+
+    * ``focus_input()`` 的 ``if not box: return False`` —— 死代码；
+    * 文本发送的 ``if not box: 重试``（6 次）—— 死代码；
+    * ``_open_chat_and_settle()`` 的 5 次重试 —— 永远「成功」；
+    * ``wx.open_chat()`` 的成败判断 —— 永远成功；
+    * ``send_file()`` 的「会话复用」捷径 —— 输入框没就绪也照走。
+
+    后果：附件被粘到猜测坐标上、根本没进输入框，而
+    ``_paste_attachment_and_send`` 对**非图片**附件是**无条件 return True** 的，
+    于是整条链路记成「发送成功」。0.8.7 实测：群聊 101.6 MB 视频下载成功、
+    发送落空、日志记成功，聊天里什么都没多出来。
+
+    这里把兜底换成 ``None``，并在放弃前**强制重新校准一次**（忽略
+    ``_auto_recalibrated`` 的「每会话一次」限制，30 秒内不重复校准），
+    让库原本的重试逻辑真正生效；定位不到就明确失败，不再往错误坐标上盲粘。
+    """
+    try:
+        from wechatauto.guia import WeChatGUI
+    except Exception as exc:  # pragma: no cover - 缺依赖时安静跳过
+        logger.debug(f"加载 wechatauto 输入框兼容层失败: {exc}")
+        return
+
+    if getattr(WeChatGUI, "_wechatbot_strict_input_box", False):
+        return
+
+    WeChatGUI.get_input_box = _strict_input_box
+    WeChatGUI._wechatbot_strict_input_box = True
+    logger.info("已启用输入框严格定位：探测失败不再回退到猜测坐标")
+
+
+#: 输入框定位的探测轮数 / 间隔，以及「强制重新校准」的最小间隔（秒）。
+#: 抽成模块常量便于测试直接调小，不必真等 3 秒。
+_INPUT_BOX_PROBE_ATTEMPTS = 6
+_INPUT_BOX_PROBE_INTERVAL = 0.5
+_INPUT_BOX_RECALIBRATE_INTERVAL = 30.0
+
+
+def _strict_input_box(gui) -> tuple | None:
+    """严格版输入框定位：探测 + 重校准都失败就返回 ``None``（不给猜测坐标）。
+
+    与 wechatauto 原实现的唯一区别就是**最后不再兜底返回猜测矩形**——正是这个
+    兜底让库里所有 ``if not box:`` 的安全网失效。细节见
+    :func:`_install_wechatauto_input_box_guard`。
+    """
+    probe = gui._probe_input_box
+    for _ in range(_INPUT_BOX_PROBE_ATTEMPTS):
+        box = probe()
+        if box:
+            return box
+        time.sleep(_INPUT_BOX_PROBE_INTERVAL)
+        gui._update_render_rect()
+
+    # 探测失败：强制重新校准一次再试。原实现被 ``_auto_recalibrated`` 限制成
+    # 「每会话只触发一次」，第二次失败就再也救不回来了。校准开销大，
+    # 这个间隔内不重复做。
+    now = time.time()
+    if now - getattr(gui, "_wechatbot_last_recalibrate", 0.0) > _INPUT_BOX_RECALIBRATE_INTERVAL:
+        gui._wechatbot_last_recalibrate = now
+        gui._auto_recalibrated = False
+        try:
+            gui.calibrate_layout()
+        except Exception as exc:
+            logger.debug(f"重新校准微信布局失败: {exc}")
+        for _ in range(3):
+            box = probe()
+            if box:
+                logger.info("重新校准布局后成功定位输入框")
+                return box
+            time.sleep(_INPUT_BOX_PROBE_INTERVAL)
+            gui._update_render_rect()
+
+    logger.warning(
+        "输入框定位失败（探测 + 重新校准都没成功），本次放弃粘贴——"
+        "宁可报失败，也不把附件粘到猜测出来的错误位置上"
+    )
+    return None
+
+
 def _install_wechatauto_uia_compat() -> None:
     """Keep UIA usable when Windows blocks third-party module enumeration.
 
@@ -406,6 +493,7 @@ def _install_wechatauto_uia_compat() -> None:
     never clicks, scans, or otherwise handles a login prompt.
     """
     _install_wechatauto_screenshot_compat()
+    _install_wechatauto_input_box_guard()
 
     try:
         from wechatauto.uia_driver import WeChatUIA
@@ -606,6 +694,10 @@ class WeChatBridge:
     # 附件发送后回查数据库确认的等待上限。微信落库是异步的，大附件更慢，
     # 但也不能无限等——超时就判定为「微信没收下」，让上层能看见失败。
     FILE_CONFIRM_TIMEOUT_SECONDS = 10.0
+    #: 附件发送的最大尝试次数。**只对「微信明确拒绝」重试**——那种情况说明
+    #: 附件压根没粘上去（典型是输入框定位失败），重发不会重复。若只是数据库
+    #: 没确认（可能落库慢），一律不重试，避免同一附件发两遍。
+    FILE_SEND_ATTEMPTS = 2
     #: 视为「附件已落地」的消息类型（对应 wechatauto 的 MSG_TYPE_NAMES）。
     #: 图片=3、视频=43、文件/链接/卡片=49。视频消息正文里没有文件名，
     #: 只能像图片一样靠「类型 + 时序」判断。
@@ -2460,30 +2552,52 @@ class WeChatBridge:
         ``return True``。微信若因体积超限、输入框未就绪等原因没有真的把附件放
         上去，这里既不会抛异常也不会返回失败，只表现为「聊天里什么都没多出来」。
         0.8.7 实测就踩到了：群里 101.6 MB 的视频被静默吞掉，日志却记成功。
+
+        **重试策略**：只有「微信明确拒绝」时才重试——那种情况下附件根本没粘上
+        去（典型是输入框定位失败，见 :func:`_install_wechatauto_input_box_guard`），
+        重发是安全的。反过来，如果操作执行了、只是**数据库没确认**，那可能只是
+        落库慢，重试有重复发送的风险，所以直接判失败、不再重试。
         """
         try:
             if self._backend == "wechatauto":
                 from wechatauto.utils.lock import LockManager
 
                 with LockManager.acquire():
-                    self._reset_layout_recalibration()
-                    before_seq = self._target_seq(room_name)
-                    result = self._wx.SendFiles(
-                        file_path,
-                        who=room_name,
-                        exact=True,
-                    )
-                    if not (result is None or bool(result)):
+                    reason = ""
+                    for attempt in range(1, self.FILE_SEND_ATTEMPTS + 1):
+                        self._reset_layout_recalibration()
+                        before_seq = self._target_seq(room_name)
+                        result = self._wx.SendFiles(
+                            file_path,
+                            who=room_name,
+                            exact=True,
+                        )
+                        if not (result is None or bool(result)):
+                            # 明确被拒：没有粘贴成功，重试安全。
+                            reason = f"微信拒绝了本次发送：{result}"
+                            logger.warning(
+                                f"发送文件被拒绝（第 {attempt}/"
+                                f"{self.FILE_SEND_ATTEMPTS} 次）: [{room_name}] "
+                                f"{os.path.basename(file_path)}: {result}"
+                            )
+                            continue
+                        if self._confirm_file_sent(room_name, before_seq):
+                            if attempt > 1:
+                                logger.info(
+                                    f"第 {attempt} 次尝试后发送成功: "
+                                    f"[{room_name}] {os.path.basename(file_path)}"
+                                )
+                            return True
+                        # 操作执行了但库没确认：可能只是落库慢，不重试以免重复发送。
                         logger.error(
-                            f"发送文件被拒绝: [{room_name}] {file_path}: {result}"
+                            "发送文件未在数据库中得到确认，微信很可能没有真正收下"
+                            f"这个附件（体积超限 / 输入框未就绪）: [{room_name}] "
+                            f"{os.path.basename(file_path)}"
                         )
                         return False
-                    if self._confirm_file_sent(room_name, before_seq):
-                        return True
                     logger.error(
-                        "发送文件未在数据库中得到确认，微信很可能没有真正收下"
-                        f"这个附件（体积超限 / 输入框未就绪）: [{room_name}] "
-                        f"{os.path.basename(file_path)}"
+                        f"发送文件失败（已尝试 {self.FILE_SEND_ATTEMPTS} 次）"
+                        f"[{room_name}] {os.path.basename(file_path)}：{reason}"
                     )
                     return False
             result = self._wx.SendFiles(file_path, who=room_name)

@@ -1887,6 +1887,127 @@ class BridgeFileSendConfirmTests(unittest.TestCase):
         bridge = self._bridge(module, SimpleNamespace())
         bridge._reset_layout_recalibration()
 
+    # -- 明确被拒时重试（0.8.9） -------------------------------------------
+
+    def _counting_wx(self, module, results, fake):
+        calls = {"n": 0}
+
+        def send_files(*args, **kwargs):
+            index = min(calls["n"], len(results) - 1)
+            calls["n"] += 1
+            return results[index]
+
+        wx = SimpleNamespace(_db=fake, SendFiles=send_files)
+        return wx, calls
+
+    def _tmp_file(self, tmp):
+        target = Path(tmp) / "clip.mp4"
+        target.write_bytes(b"x")
+        return str(target)
+
+    def test_retries_when_wechat_explicitly_rejects(self):
+        """微信明确拒绝 → 附件没粘上去，重发是安全的，应重试到上限。"""
+        module = self._module()
+        fake = _FakeWxDb(seq=100, new=[])
+        wx, calls = self._counting_wx(module, [0, 0], fake)
+        bridge = self._bridge(module, wx)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(bridge._send_file_sync("群聊", self._tmp_file(tmp)))
+        self.assertEqual(calls["n"], 2, "明确被拒时应重试到 FILE_SEND_ATTEMPTS 次")
+
+    def test_succeeds_on_second_attempt(self):
+        """第一次被拒、第二次成功并落库 → 整体成功。"""
+        module = self._module()
+        fake = _FakeWxDb(seq=100, new=[{"sender_id": 2, "type": "视频", "sort_seq": 101}])
+        wx, calls = self._counting_wx(module, [0, None], fake)
+        bridge = self._bridge(module, wx)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(bridge._send_file_sync("群聊", self._tmp_file(tmp)))
+        self.assertEqual(calls["n"], 2)
+
+    def test_does_not_retry_when_only_unconfirmed(self):
+        """操作执行了但库没确认（可能只是落库慢）→ 不重试，避免同一附件发两遍。"""
+        module = self._module()
+        fake = _FakeWxDb(seq=100, new=[])
+        wx, calls = self._counting_wx(module, [None, None], fake)
+        bridge = self._bridge(module, wx)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(bridge._send_file_sync("群聊", self._tmp_file(tmp)))
+        self.assertEqual(calls["n"], 1, "落库未确认时不得重发（会重复发送）")
+
+
+class _FakeGui:
+    """只实现 `_strict_input_box` 用到的那几个方法。"""
+
+    def __init__(self, boxes):
+        """``boxes`` 是 ``_probe_input_box`` 依次返回的值（None 表示探测失败）。"""
+        self._boxes = list(boxes)
+        self.probe_calls = 0
+        self.recalibrated = 0
+        self._auto_recalibrated = True
+
+    def _probe_input_box(self):
+        self.probe_calls += 1
+        if not self._boxes:
+            return None
+        value = self._boxes.pop(0)
+        return value
+
+    def _update_render_rect(self):
+        pass
+
+    def calibrate_layout(self):
+        self.recalibrated += 1
+
+
+class StrictInputBoxTests(unittest.TestCase):
+    """输入框严格定位：探测失败必须返回 None，不能给猜测坐标。
+
+    回归点：wechatauto 的 ``get_input_box()`` 探测失败时会兜底返回一个按
+    ``render_h`` 比例算出来的猜测矩形，**永不返回 None**；而库里所有安全网
+    （``focus_input`` 的 ``if not box``、``_open_chat_and_settle`` 的 5 次重试、
+    ``send_file`` 的会话复用判断）都建立在「失败返回 None」上，于是一次性全部
+    失效——附件被粘到错误坐标上，聊天里什么都没多出来，日志却记成功。
+    """
+
+    @staticmethod
+    def _module():
+        return BridgeFileSendConfirmTests._module()
+
+    def setUp(self):
+        self.module = self._module()
+        self._old_interval = self.module._INPUT_BOX_PROBE_INTERVAL
+        self.module._INPUT_BOX_PROBE_INTERVAL = 0.0
+
+    def tearDown(self):
+        self.module._INPUT_BOX_PROBE_INTERVAL = self._old_interval
+
+    def test_returns_box_when_probe_succeeds(self):
+        gui = _FakeGui([None, (10, 20, 30, 40)])
+        self.assertEqual(self.module._strict_input_box(gui), (10, 20, 30, 40))
+        self.assertEqual(gui.recalibrated, 0, "探测成功时不该触发重新校准")
+
+    def test_recalibrates_then_returns_box(self):
+        """探测失败 → 强制重新校准一次 → 校准后探测成功。"""
+        gui = _FakeGui([None] * 6 + [(1, 2, 3, 4)])
+        self.assertEqual(self.module._strict_input_box(gui), (1, 2, 3, 4))
+        self.assertEqual(gui.recalibrated, 1)
+        self.assertFalse(gui._auto_recalibrated, "必须无视「每会话一次」的限制")
+
+    def test_returns_none_instead_of_guessed_box(self):
+        """探测 + 重校准都失败 → 返回 None（而不是猜测矩形）。"""
+        gui = _FakeGui([None] * 20)
+        self.assertIsNone(self.module._strict_input_box(gui))
+        self.assertEqual(gui.recalibrated, 1)
+
+    def test_recalibration_is_throttled(self):
+        """重新校准开销大，间隔内不重复触发。"""
+        gui = _FakeGui([None] * 20)
+        self.module._INPUT_BOX_RECALIBRATE_INTERVAL = 9999.0
+        self.assertIsNone(self.module._strict_input_box(gui))
+        self.module._strict_input_box(gui)
+        self.assertEqual(gui.recalibrated, 1, "第二次调用不应再次校准")
+
 
 class _FakeWxDb:
     """只实现回查确认用到的那几个 WeChatDB 方法。"""
