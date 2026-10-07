@@ -161,6 +161,21 @@ def load_wechat_bridge(project_path: Path) -> type:
     return module.WeChatBridge
 
 
+def _apply_send_attempts(bridge: Any, attempts: int) -> None:
+    """把「附件没发成功时最多再试几次」写进桥接层。
+
+    桥接层用类常量控制两处重试：整条重发（只对「微信明确拒绝」）与补按回车
+    （对「附件粘进去了、但回车被微信吞掉」）。这里按「首次 + 重试 attempts 次」
+    统一换算：重发次数 = ``1 + attempts``，补按回车次数 = ``attempts``。
+    换算关系写在桥接层的常量注释里，改动时两边要一起看。
+    """
+    try:
+        bridge.FILE_SEND_ATTEMPTS = max(1, 1 + int(attempts))
+        bridge.FILE_SEND_ENTER_NUDGES = max(0, int(attempts))
+    except (AttributeError, TypeError, ValueError):
+        return
+
+
 class DeepSeekGirlAdapter:
     """独立的微信适配层，可脱离原机器人直接调用。"""
 
@@ -172,6 +187,8 @@ class DeepSeekGirlAdapter:
         self._config = config or AdapterConfig.from_env()
         self._bridge_factory = bridge_factory
         self._bridge: Any | None = None
+        # 附件发送失败后的重试次数；None = 用桥接层自带的默认值。
+        self._send_attempts: int | None = None
         self._send_lock = asyncio.Lock()
         self._buffer: deque[MessageRecord] = deque(
             maxlen=self._config.history_buffer_size
@@ -218,6 +235,8 @@ class DeepSeekGirlAdapter:
                 listen_private=self._config.listen_private,
             )
         self._apply_send_timeout(bridge)
+        if self._send_attempts is not None:
+            _apply_send_attempts(bridge, self._send_attempts)
         return bridge
 
     def _apply_send_timeout(self, bridge: Any) -> None:
@@ -231,6 +250,21 @@ class DeepSeekGirlAdapter:
         except (AttributeError, TypeError, ValueError):
             return
         bridge.SEND_TIMEOUT_SECONDS = max(current, self._config.send_timeout_seconds)
+
+    def apply_send_attempts(self, attempts: int) -> None:
+        """设置「附件没发成功时最多再试几次」（0 = 不重试）。
+
+        桥接层是在 ``connect()`` 时才建的，而配置可能在连接前就设好，所以这里
+        把值记下来，建桥时再套用一次——重连后也不会丢。
+        """
+        try:
+            value = max(0, min(10, int(attempts)))
+        except (TypeError, ValueError):
+            return
+        self._send_attempts = value
+        bridge = self._bridge
+        if bridge is not None:
+            _apply_send_attempts(bridge, value)
 
     async def connect(self) -> StatusResult:
         """连接已登录的微信客户端，并按配置启动消息监听。"""

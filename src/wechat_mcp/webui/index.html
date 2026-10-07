@@ -298,6 +298,11 @@
           </div>
           <p class="hint">微信对单文件有体积上限，且<b>随会话类型不同</b>：自聊 / 文件传输助手最宽松（高速传输可达 10 GB），普通聊天较严（旧版 100 MB）。设得过大容易下载到发不出去的文件；默认 100。</p>
           <div class="field">
+            <label>发送失败后重试次数（0=不重试）</label>
+            <input type="number" min="0" max="10" data-key="link_send_attempts"/>
+          </div>
+          <p class="hint">附件<b>没发成功</b>时最多再试几次，默认 2。两个方向都用这个次数：微信<b>明确拒绝</b>（附件压根没粘上去）会整条重来；附件<b>粘进去了、但回车没被微信接受</b>（大文件粘贴后微信还要先拷原始文件、生成卡片，这期间的回车会被丢掉）只补按回车、不重新粘贴，所以<b>不会重复发送</b>。调大更耐折腾，代价是发送失败时会多占一会儿发送通道。</p>
+          <div class="field">
             <label>下载目录（留空用默认）</label>
             <input type="text" data-key="link_download_dir" placeholder="留空：%APPDATA%\wechat-mcp\downloads"/>
           </div>

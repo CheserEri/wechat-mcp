@@ -69,6 +69,8 @@ class FakeAdapter:
         self.files = []
         # 适配层配置（None 表示未提供，链接下载的白名单注入会跳过）。
         self.config = None
+        # 引擎推过来的「发送失败后重试次数」（未推送时为 None）。
+        self.send_attempts = None
 
     def add_message_listener(self, listener):
         self.listeners.append(listener)
@@ -97,6 +99,10 @@ class FakeAdapter:
             result = listener(record)
             if asyncio.iscoroutine(result):
                 await result
+
+    def apply_send_attempts(self, attempts):
+        """记录引擎推过来的「发送失败后重试次数」。"""
+        self.send_attempts = int(attempts)
 
     async def pump(self):
         # 等待消费循环处理完队列；留足余量避免调度抖动导致的偶发失败。
@@ -3281,6 +3287,8 @@ class LinkConfigTests(unittest.TestCase):
         self.assertTrue(cfg.link_ack_enabled)
         self.assertEqual(cfg.link_ack_text, "正在解析链接")
         self.assertTrue(cfg.link_llm_followup)
+        # 附件没发成功时默认再试 2 次。
+        self.assertEqual(cfg.link_send_attempts, 2)
 
     def test_ack_text_is_trimmed_and_newlines_collapsed(self):
         cfg = BotConfig.from_dict({"link_ack_text": "  正在\n解析  链接  "})
@@ -3313,6 +3321,57 @@ class LinkConfigTests(unittest.TestCase):
         self.assertTrue(str(BotConfig().download_dir()).endswith("downloads"))
         cfg = BotConfig.from_dict({"link_download_dir": tempfile.gettempdir()})
         self.assertEqual(cfg.download_dir(), Path(tempfile.gettempdir()))
+
+    def test_send_attempts_is_clamped_to_0_10(self):
+        """发送重试次数：0 = 不重试，上限 10（再多只是白占发送通道）。"""
+        self.assertEqual(
+            BotConfig.from_dict({"link_send_attempts": -3}).link_send_attempts, 0
+        )
+        self.assertEqual(
+            BotConfig.from_dict({"link_send_attempts": 99}).link_send_attempts, 10
+        )
+        self.assertEqual(
+            BotConfig.from_dict({"link_send_attempts": 0}).link_send_attempts, 0
+        )
+
+
+class SendAttemptsWiringTests(unittest.TestCase):
+    """「附件发送失败后重试次数」从配置推到适配层。"""
+
+    def test_pushed_on_engine_creation(self):
+        adapter = FakeAdapter()
+        BotEngine(adapter, BotConfig(link_send_attempts=4))
+        self.assertEqual(adapter.send_attempts, 4)
+
+    def test_pushed_on_config_update(self):
+        """界面保存配置后热更新，不必重启。"""
+        adapter = FakeAdapter()
+        engine = BotEngine(adapter, BotConfig(link_send_attempts=2))
+        engine.update_config(BotConfig(link_send_attempts=0))
+        self.assertEqual(adapter.send_attempts, 0)
+
+    def test_missing_method_is_tolerated(self):
+        """适配层没实现这个方法时不该拖垮启动或保存配置。"""
+
+        class BareAdapter:
+            pass
+
+        engine = BotEngine(BareAdapter(), BotConfig())
+        engine._push_send_attempts()  # 不应抛异常
+
+    def test_failing_method_is_logged_not_raised(self):
+        """推送失败只记一条警告，不让配置保存整体失败。"""
+
+        class BrokenAdapter:
+            def apply_send_attempts(self, attempts):
+                raise RuntimeError("桥接层不在")
+
+        engine = BotEngine(BrokenAdapter(), BotConfig())
+        engine._push_send_attempts()
+        self.assertTrue(
+            any("重试次数" in line["message"] for line in engine.get_logs()),
+            "应留下一条关于重试次数的警告",
+        )
 
 
 class LinkCookiesTests(unittest.TestCase):

@@ -183,6 +183,11 @@ class BotEngine:
         # 桌面壳可注入：新日志产生时回调（用于推送到前端）。
         self.on_log: Callable[[LogLine], Any] | None = None
 
+        # 附件发送失败后的重试次数由桥接层的类常量控制，随配置推给适配层
+        # （适配层会在建桥/重连时套用，所以这里推一次就够了）。必须放在最后：
+        # 推失败时会写运行日志，而写日志依赖上面刚建好的 _log_lines/_log_lock。
+        self._push_send_attempts()
+
     # ------------------------------------------------------------------ 配置
 
     @property
@@ -198,6 +203,8 @@ class BotEngine:
         self._config = config
         # 解析超时随配置热更新；缓存保留，避免重复解析。
         self._links.timeout = config.link_parse_timeout
+        # 发送重试次数同样热更新，不必重启。
+        self._push_send_attempts()
         # cookies.txt 换了路径要立刻生效：清掉失败缓存，让之前因缺 Cookie
         # 失败的链接可以马上重试，不用等 TTL 过期或重启程序。
         cookies_file = usable_cookies_file(config.link_cookies_file)
@@ -208,6 +215,20 @@ class BotEngine:
                 self._log("info", f"已启用链接解析 Cookie：{cookies_file}")
             else:
                 self._log("info", "已停用链接解析 Cookie（cookies.txt 未设置或不可读）。")
+
+    def _push_send_attempts(self) -> None:
+        """把「附件没发成功时最多再试几次」推给适配层。
+
+        适配层是可注入的接口，测试里的假适配器不一定实现这个方法，取不到就
+        安静跳过——重试次数推不过去不该拖垮启动或配置保存。
+        """
+        apply = getattr(self._adapter, "apply_send_attempts", None)
+        if apply is None:
+            return
+        try:
+            apply(self._config.link_send_attempts)
+        except Exception as exc:  # noqa: BLE001 - 尽力而为
+            self._log("warning", f"应用「发送失败后重试次数」失败：{exc}")
 
     # ------------------------------------------------------------------ 启停
 

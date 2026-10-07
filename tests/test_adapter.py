@@ -43,6 +43,9 @@ class FakeBridge:
     """模拟 deepseekgirl 的 WeChatBridge，仅实现适配层用到的最小接口。"""
 
     SEND_TIMEOUT_SECONDS = 5.0
+    # 桥接层用类常量控制「附件发送失败后的重试」，适配层会按配置覆盖。
+    FILE_SEND_ATTEMPTS = 2
+    FILE_SEND_ENTER_NUDGES = 2
 
     def __init__(self) -> None:
         self.on_message = None
@@ -212,6 +215,33 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_send_timeout_is_widened(self):
         await self.adapter.connect()
         self.assertEqual(self.bridge.SEND_TIMEOUT_SECONDS, 20.0)
+
+    async def test_send_attempts_are_applied_when_bridge_is_built(self):
+        """连接前设好的重试次数，建桥时要套用（重连后也不会丢）。
+
+        换算：重发次数 = 1 + 重试次数；补按回车次数 = 重试次数。
+        """
+        self.adapter.apply_send_attempts(4)
+        await self.adapter.connect()
+        self.assertEqual(self.bridge.FILE_SEND_ATTEMPTS, 5)
+        self.assertEqual(self.bridge.FILE_SEND_ENTER_NUDGES, 4)
+
+    async def test_send_attempts_are_applied_to_a_live_bridge(self):
+        """已连接时改配置要立刻生效，0 表示不重试。"""
+        await self.adapter.connect()
+        self.adapter.apply_send_attempts(0)
+        self.assertEqual(self.bridge.FILE_SEND_ATTEMPTS, 1)
+        self.assertEqual(self.bridge.FILE_SEND_ENTER_NUDGES, 0)
+
+    async def test_send_attempts_are_clamped(self):
+        """非法值与超范围值都归一到 0..10。"""
+        self.adapter.apply_send_attempts(-5)
+        await self.adapter.connect()
+        self.assertEqual(self.bridge.FILE_SEND_ATTEMPTS, 1)
+        self.adapter.apply_send_attempts(99)
+        self.assertEqual(self.bridge.FILE_SEND_ENTER_NUDGES, 10)
+        self.adapter.apply_send_attempts("坏值")
+        self.assertEqual(self.bridge.FILE_SEND_ENTER_NUDGES, 10, "非法值应被忽略")
 
     async def test_dry_run_does_not_send(self):
         await self.adapter.connect()

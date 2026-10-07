@@ -127,6 +127,14 @@ class BotConfig:
     # 下载目录**总占用**上限（MB）：超出后自动删除最旧的文件，直到降到上限以内。
     # 0 = 不限制。默认 1 GB——长期运行不至于把磁盘吃满，正常使用也很少触发。
     link_download_quota_mb: int = 1024
+    # 附件**没发成功**时最多再试几次（0 = 不重试，默认 2）。
+    # 每次重试都会回查数据库确认，两个方向都会用上这个次数：
+    #   1) 微信明确拒绝（附件压根没粘上去）→ 整条重来；
+    #   2) 附件粘进去了、但回车被微信吞掉（大文件粘贴后微信还在拷原始文件、
+    #      生成卡片，这期间的回车会被丢掉）→ 只补按回车、不重新粘贴，
+    #      所以**不会重复发送**。
+    # 调大更耐折腾，代价是发送失败时占用发送闸门的时间更久。
+    link_send_attempts: int = 2
     # X（Twitter）推文额外发一张本地渲染的卡片图（头像/昵称/正文/配图）。
     # 仅对 X 推文生效；推文含视频时还会下载视频一并回发。
     link_tweet_card_enabled: bool = True
@@ -212,6 +220,8 @@ class BotConfig:
         config.link_download_dir = str(config.link_download_dir or "").strip()
         config.link_download_max_mb = max(0, int(config.link_download_max_mb))
         config.link_download_quota_mb = max(0, int(config.link_download_quota_mb))
+        # 重试次数上限给到 10：再多也只是让发送闸门被占更久，收益递减。
+        config.link_send_attempts = min(10, max(0, int(config.link_send_attempts)))
         config.link_tweet_card_enabled = bool(config.link_tweet_card_enabled)
         config.link_ack_enabled = bool(config.link_ack_enabled)
         # 文案留空即视为「不发提示」，故不做默认值回填（只去空白与换行）。
