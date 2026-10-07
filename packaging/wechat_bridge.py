@@ -698,6 +698,16 @@ class WeChatBridge:
     #: 附件压根没粘上去（典型是输入框定位失败），重发不会重复。若只是数据库
     #: 没确认（可能落库慢），一律不重试，避免同一附件发两遍。
     FILE_SEND_ATTEMPTS = 2
+    #: 附件「已粘进输入框、但回车没被微信接受」时，补按回车的次数与间隔（秒）。
+    #: 微信粘贴大文件后要先把**原始文件**拷进自己的视频目录并生成卡片，这期间
+    #: 按下的回车会被丢掉。实测那条 101.6 MB 的视频：原始文件 10:26:45 就已经
+    #: 进了微信的 `msg/video/2026-10/<hash>_raw.mp4`（说明**粘贴是成功的**），
+    #: 但数据库里直到 12:33 人工点「发送」才出现消息行——中间那两个小时里，
+    #: 附件就静静躺在输入框里（用户截图可见）。
+    #: **补按回车是安全的**：草稿还在就把它发出去；输入框已空则回车什么也不做，
+    #: 不会重复发送。
+    FILE_SEND_ENTER_NUDGES = 2
+    FILE_SEND_ENTER_NUDGE_INTERVAL = 3.0
     #: 附件体积的**告警**阈值（MB），**只写日志、不拦截发送**。
     #: 微信的单文件上限**随会话类型变化**：自聊 / 文件传输助手最宽松（高速传输
     #: 可达 10 GB），普通聊天较严（旧版 100 MB）。所以这里只提醒一句，不替微信
@@ -2626,10 +2636,21 @@ class WeChatBridge:
                                     f"[{room_name}] {os.path.basename(file_path)}"
                                 )
                             return True
-                        # 操作执行了但库没确认：可能只是落库慢，不重试以免重复发送。
+                        # 没确认：最可能是「附件已经粘进输入框，但回车被微信吞了」
+                        # （大文件粘贴后微信要先拷原始文件、生成卡片，这期间的回车
+                        # 会被丢掉，草稿会一直留在输入框里）。
+                        # 补按回车是安全的：草稿还在就发出去，输入框已空则回车
+                        # 什么也不做，所以**不会重复发送**——这也是这里不像
+                        # 「明确被拒」那样整条重来的原因。
+                        if self._nudge_enter_until_confirmed(room_name, before_seq):
+                            logger.info(
+                                f"补按回车后发送成功: [{room_name}] "
+                                f"{os.path.basename(file_path)}"
+                            )
+                            return True
                         logger.error(
                             "发送文件未在数据库中得到确认，微信很可能没有真正收下"
-                            f"这个附件（体积超限 / 输入框未就绪）: [{room_name}] "
+                            f"这个附件（输入框未就绪 / 微信拒收）: [{room_name}] "
                             f"{os.path.basename(file_path)}"
                         )
                         return False
@@ -2642,6 +2663,52 @@ class WeChatBridge:
             return result is None or bool(result)
         except Exception as exc:
             logger.error(f"发送文件异常: {exc}")
+            return False
+
+    def _nudge_enter_until_confirmed(self, room_name: str, before_seq: int) -> bool:
+        """补按回车，直到数据库确认附件落地（最多 ``FILE_SEND_ENTER_NUDGES`` 次）。
+
+        为什么要补：微信粘贴大文件后要先把**原始文件**拷进自己的视频目录并生成
+        卡片，这期间按下的回车会被丢掉——附件会一直留在输入框里（实测那条
+        101.6 MB 的视频在输入框里躺了两个小时，直到人工点「发送」才发出去）。
+        粘贴本身是成功的，缺的只是「再按一次回车」。
+
+        安全性：只按回车、**不重新粘贴**。草稿还在就把附件发出去；输入框已经
+        空了（说明上一次其实已经发出去）回车什么也不做，所以不存在重复发送。
+        定位不到输入框时**不按**——回车会落到当前拥有焦点的窗口上，那更危险。
+        """
+        gui = getattr(self._wx, "_gui", None)
+        if gui is None:
+            return False
+        for nudge in range(1, self.FILE_SEND_ENTER_NUDGES + 1):
+            time.sleep(self.FILE_SEND_ENTER_NUDGE_INTERVAL)
+            if not self._press_enter(gui):
+                return False
+            logger.warning(
+                f"发送未确认，已补按回车（第 {nudge}/"
+                f"{self.FILE_SEND_ENTER_NUDGES} 次）: [{room_name}]"
+            )
+            if self._confirm_file_sent(room_name, before_seq):
+                return True
+        return False
+
+    @staticmethod
+    def _press_enter(gui) -> bool:
+        """把焦点放回输入框再按一次回车；定位不到输入框就不按。"""
+        try:
+            from wechatauto.guia import VK_RETURN
+
+            box = gui.get_input_box()
+            if not box:
+                logger.warning("补按回车前定位不到输入框，跳过（不盲按回车）")
+                return False
+            if not gui.focus_input(box):
+                logger.warning("补按回车前无法聚焦输入框，跳过")
+                return False
+            gui._input.key(VK_RETURN)
+            return True
+        except Exception as exc:  # noqa: BLE001 - 尽力而为，不因此判失败
+            logger.debug(f"补按回车失败（忽略）: {exc}")
             return False
 
     def _reset_layout_recalibration(self) -> None:

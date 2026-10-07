@@ -1972,6 +1972,73 @@ class BridgeFileSendConfirmTests(unittest.TestCase):
         self.assertIn("2.0 MB", hint)
         self.assertIn("1 MB", hint)
 
+    def test_nudges_enter_when_unconfirmed_then_succeeds(self):
+        """附件粘进输入框了、但回车被微信吞了 → 补按回车后发送成功。
+
+        实测那条 101.6 MB 的视频：微信 10:26:45 就把原始文件拷进了自己的视频
+        目录（说明**粘贴成功**），但数据库直到 12:33 人工点「发送」才有消息行——
+        附件一直在输入框里躺着（用户截图可见）。所以「没确认」时该做的是
+        **再按一次回车**，而不是直接判失败。
+        """
+        module = self._module()
+        fake = _FakeWxDb(seq=100, new=[])
+        pressed = []
+        gui = SimpleNamespace(
+            get_input_box=lambda: (0, 0, 10, 10),
+            focus_input=lambda box: True,
+            _input=SimpleNamespace(key=lambda vk: pressed.append(vk)),
+        )
+        wx = SimpleNamespace(_db=fake, SendFiles=lambda *a, **k: None, _gui=gui)
+        bridge = self._bridge(module, wx)
+        bridge.FILE_SEND_ENTER_NUDGE_INTERVAL = 0.0
+        results = [False, True]  # 第一次没确认；补按回车后确认
+        bridge._confirm_file_sent = lambda *a: results.pop(0) if results else True
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(bridge._send_file_sync("群聊", self._tmp_file(tmp)))
+        self.assertEqual(len(pressed), 1, "应补按一次回车")
+
+    def test_gives_up_after_nudges_exhausted(self):
+        """补按回车用完仍没确认 → 判失败（不再无限按）。"""
+        module = self._module()
+        fake = _FakeWxDb(seq=100, new=[])
+        pressed = []
+        gui = SimpleNamespace(
+            get_input_box=lambda: (0, 0, 10, 10),
+            focus_input=lambda box: True,
+            _input=SimpleNamespace(key=lambda vk: pressed.append(vk)),
+        )
+        wx = SimpleNamespace(_db=fake, SendFiles=lambda *a, **k: None, _gui=gui)
+        bridge = self._bridge(module, wx)
+        bridge.FILE_SEND_ENTER_NUDGE_INTERVAL = 0.0
+        bridge._confirm_file_sent = lambda *a: False
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(bridge._send_file_sync("群聊", self._tmp_file(tmp)))
+        self.assertEqual(len(pressed), module.WeChatBridge.FILE_SEND_ENTER_NUDGES)
+
+    def test_does_not_press_enter_without_input_box(self):
+        """定位不到输入框时**不**补按回车——回车会落到当前有焦点的别的窗口上。"""
+        module = self._module()
+        pressed = []
+        gui = SimpleNamespace(
+            get_input_box=lambda: None,
+            focus_input=lambda box: True,
+            _input=SimpleNamespace(key=lambda vk: pressed.append(vk)),
+        )
+        self.assertFalse(module.WeChatBridge._press_enter(gui))
+        self.assertEqual(pressed, [])
+
+    def test_does_not_press_enter_when_focus_fails(self):
+        """聚焦输入框失败时也不按回车。"""
+        module = self._module()
+        pressed = []
+        gui = SimpleNamespace(
+            get_input_box=lambda: (0, 0, 10, 10),
+            focus_input=lambda box: False,
+            _input=SimpleNamespace(key=lambda vk: pressed.append(vk)),
+        )
+        self.assertFalse(module.WeChatBridge._press_enter(gui))
+        self.assertEqual(pressed, [])
+
 
 class _FakeGui:
     """只实现 `_strict_input_box` 用到的那几个方法。"""
