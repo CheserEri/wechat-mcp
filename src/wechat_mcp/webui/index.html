@@ -303,15 +303,6 @@
           </div>
           <p class="hint">附件<b>没发成功</b>时最多再试几次，默认 2。两个方向都用这个次数：微信<b>明确拒绝</b>（附件压根没粘上去）会整条重来；附件<b>粘进去了、但回车没被微信接受</b>（大文件粘贴后微信还要先拷原始文件、生成卡片，这期间的回车会被丢掉）只补按回车、不重新粘贴，所以<b>不会重复发送</b>。调大更耐折腾，代价是发送失败时会多占一会儿发送通道。</p>
           <div class="field">
-            <label>附件发送方式</label>
-            <select data-key="link_file_send_mode">
-              <option value="auto">自动（先试「发送文件」按钮，失败再退回剪贴板）</option>
-              <option value="dialog">只用「发送文件」按钮</option>
-              <option value="clipboard">只用剪贴板粘贴（旧行为）</option>
-            </select>
-          </div>
-          <p class="hint">「发送文件」按钮方式：程序点微信输入框上的<b>文件按钮</b>，在弹出的系统对话框里直接填入文件路径再确认。它<b>不截屏、不 OCR</b>，约 1 秒完成，比剪贴板粘贴更稳（剪贴板方式依赖截屏找输入框，窗口一缩到托盘就会失败）。默认<b>自动</b>：先试按钮方式，不行再退回剪贴板。仅在 wechatauto 后端生效。</p>
-          <div class="field">
             <label>下载目录（留空用默认）</label>
             <input type="text" data-key="link_download_dir" placeholder="留空：%APPDATA%\wechat-mcp\downloads"/>
           </div>

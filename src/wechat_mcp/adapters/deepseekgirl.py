@@ -176,21 +176,6 @@ def _apply_send_attempts(bridge: Any, attempts: int) -> None:
         return
 
 
-def _apply_file_send_mode(bridge: Any, mode: str) -> None:
-    """把「附件发送路线」写进桥接层（``auto`` / ``dialog`` / ``clipboard``）。
-
-    桥接层对未知值一律按 ``auto`` 处理，所以这里不需要额外校验，只做透传。
-    """
-    apply = getattr(bridge, "apply_file_send_mode", None)
-    if callable(apply):
-        apply(mode)
-        return
-    try:  # 老版本桥接层没有这个方法，直接写类属性也行
-        bridge.FILE_SEND_MODE = str(mode or "auto").strip().lower() or "auto"
-    except (AttributeError, TypeError):
-        return
-
-
 class DeepSeekGirlAdapter:
     """独立的微信适配层，可脱离原机器人直接调用。"""
 
@@ -204,8 +189,6 @@ class DeepSeekGirlAdapter:
         self._bridge: Any | None = None
         # 附件发送失败后的重试次数；None = 用桥接层自带的默认值。
         self._send_attempts: int | None = None
-        # 附件发送路线（auto/dialog/clipboard）；None = 用桥接层自带的默认值。
-        self._file_send_mode: str | None = None
         self._send_lock = asyncio.Lock()
         self._buffer: deque[MessageRecord] = deque(
             maxlen=self._config.history_buffer_size
@@ -254,8 +237,6 @@ class DeepSeekGirlAdapter:
         self._apply_send_timeout(bridge)
         if self._send_attempts is not None:
             _apply_send_attempts(bridge, self._send_attempts)
-        if self._file_send_mode is not None:
-            _apply_file_send_mode(bridge, self._file_send_mode)
         return bridge
 
     def _apply_send_timeout(self, bridge: Any) -> None:
@@ -284,20 +265,6 @@ class DeepSeekGirlAdapter:
         bridge = self._bridge
         if bridge is not None:
             _apply_send_attempts(bridge, value)
-
-    def apply_file_send_mode(self, mode: str) -> None:
-        """设置附件发送路线（``auto`` / ``dialog`` / ``clipboard``）。
-
-        与 :meth:`apply_send_attempts` 同理：桥接层在 ``connect()`` 时才建，
-        所以先记下来，建桥时再套用一次，重连后也不会丢。
-        """
-        value = str(mode or "auto").strip().lower()
-        if value not in ("auto", "dialog", "clipboard"):
-            value = "auto"
-        self._file_send_mode = value
-        bridge = self._bridge
-        if bridge is not None:
-            _apply_file_send_mode(bridge, value)
 
     async def connect(self) -> StatusResult:
         """连接已登录的微信客户端，并按配置启动消息监听。"""

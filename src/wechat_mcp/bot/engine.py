@@ -187,8 +187,6 @@ class BotEngine:
         # （适配层会在建桥/重连时套用，所以这里推一次就够了）。必须放在最后：
         # 推失败时会写运行日志，而写日志依赖上面刚建好的 _log_lines/_log_lock。
         self._push_send_attempts()
-        # 附件发送路线同理：也是桥接层的类常量，随配置推一次即可。
-        self._push_file_send_mode()
 
     # ------------------------------------------------------------------ 配置
 
@@ -207,8 +205,6 @@ class BotEngine:
         self._links.timeout = config.link_parse_timeout
         # 发送重试次数同样热更新，不必重启。
         self._push_send_attempts()
-        # 附件发送路线同样热更新。
-        self._push_file_send_mode()
         # cookies.txt 换了路径要立刻生效：清掉失败缓存，让之前因缺 Cookie
         # 失败的链接可以马上重试，不用等 TTL 过期或重启程序。
         cookies_file = usable_cookies_file(config.link_cookies_file)
@@ -233,19 +229,6 @@ class BotEngine:
             apply(self._config.link_send_attempts)
         except Exception as exc:  # noqa: BLE001 - 尽力而为
             self._log("warning", f"应用「发送失败后重试次数」失败：{exc}")
-
-    def _push_file_send_mode(self) -> None:
-        """把「附件发送路线」推给适配层（auto / dialog / clipboard）。
-
-        与 :meth:`_push_send_attempts` 一样，假适配器没有这个方法就安静跳过。
-        """
-        apply = getattr(self._adapter, "apply_file_send_mode", None)
-        if apply is None:
-            return
-        try:
-            apply(self._config.link_file_send_mode)
-        except Exception as exc:  # noqa: BLE001 - 尽力而为
-            self._log("warning", f"应用「附件发送路线」失败：{exc}")
 
     # ------------------------------------------------------------------ 启停
 

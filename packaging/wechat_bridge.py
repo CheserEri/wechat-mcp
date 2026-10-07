@@ -602,49 +602,23 @@ def _probe_input_box_rightside(gui) -> tuple | None:
 
 
 # ---------------------------------------------------------------------------
-# 原生「选择文件」对话框路线：UIA 点按钮 → Win32 填路径
+# 恢复微信主窗可见性
 # ---------------------------------------------------------------------------
 #
-# 为什么改走这条路：剪贴板路线要「探输入框（像素）→ 写 CF_HDROP → 等微信把
-# 原始文件拷进自己的目录 → 按回车」，任何一步时序错位都会静默失败；而且它
-# 依赖像素探测，窗口一被缩到托盘就全盘失效。这条路线**全程不碰像素**：
+# 为什么需要：窗口被缩到托盘时（``WS_VISIBLE`` 被清掉）``GetWindowRect`` 仍然
+# 返回完全正确的矩形，但 ``ImageGrab.grab`` 抓到的是**别的程序的画面**——所有
+# 基于像素的判断（输入框探测、会话定位）会一起失效。
 #
-#   * 「发送文件」按钮在 UIA 树里是个**有名字**的 ButtonControl（mmui::XButton）；
-#   * 它弹出的是标准 Vista+ 原生对话框（class ``#32770``，标题「选择文件」），
-#     文件名输入框是 ctrlID 1148（``edt1``）的 Edit，确认按钮是 IDOK(1)。
-#
-# 实测：找按钮 0.076s、点击 0.39s、对话框出现 0.39s、WM_SETTEXT 即时，
-# 全程约 1 秒、**0 次截屏、0 次 OCR**。
+# 顺带说明这里的私有 user32 句柄：``ctypes.windll.user32`` 是**进程内共享单例**，
+# 给它设 ``argtypes``/``restype`` 会连带改掉 wechatauto 自己的调用签名（它用的是
+# 同一个对象，而且它显式设过 ``SendMessageW.argtypes``）。单独
+# ``WinDLL("user32")`` 拿一份独立句柄，就能放心声明签名。
 
-#: UIA 树里「发送文件」按钮的名字（按顺序尝试，兼容不同版本）。
-FILE_BUTTON_NAMES = ("发送文件", "发送文件(Alt+F)")
-
-#: 原生文件对话框：窗口类 / 标题 / 控件 ID（通用对话框的固定常量）。
-FILE_DIALOG_CLASS = "#32770"
-FILE_DIALOG_TITLES = ("选择文件", "打开")
-FILE_DIALOG_EDIT_ID = 1148       # edt1：文件名输入框
-FILE_DIALOG_OK_ID = 1            # IDOK：打开
-FILE_DIALOG_CANCEL_ID = 2        # IDCANCEL：取消
-
-#: 等对话框出现的轮询参数。
-FILE_DIALOG_TIMEOUT_SECONDS = 4.0
-FILE_DIALOG_POLL_INTERVAL = 0.12
-
-WM_SETTEXT = 0x000C
-WM_GETTEXT = 0x000D
-WM_GETTEXTLENGTH = 0x000E
-BM_CLICK = 0x00F5
-WM_CLOSE = 0x0010
+#: ``ShowWindow`` 的显示状态常量。
 _SW_SHOW = 5
 _SW_RESTORE = 9
 
-#: 窗口枚举回调原型（``WINFUNCTYPE``，调用约定必须是 ``stdcall``）。
-_WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-#: 私有 user32 句柄。``ctypes.windll.user32`` 是**进程内共享单例**，给它设
-#: ``argtypes``/``restype`` 会连带改掉 wechatauto 自己的调用签名（它用的是同一个
-#: 对象，而且它显式设过 ``SendMessageW.argtypes``）。这里单独 ``WinDLL("user32")``
-#: 拿一份独立句柄，就能放心声明签名、也让 64 位的 ``LRESULT`` 不被截成 32 位。
+#: 私有 user32 句柄（惰性创建）。
 _USER32 = None
 
 
@@ -653,26 +627,6 @@ def _user32():
     global _USER32
     if _USER32 is None:
         lib = ctypes.WinDLL("user32", use_last_error=True)
-        lib.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
-                                     wintypes.WPARAM, ctypes.c_void_p]
-        lib.SendMessageW.restype = ctypes.c_ssize_t
-        lib.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND,
-                                      wintypes.LPCWSTR, wintypes.LPCWSTR]
-        lib.FindWindowExW.restype = wintypes.HWND
-        lib.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
-        lib.EnumChildWindows.argtypes = [wintypes.HWND, _WNDENUMPROC,
-                                         wintypes.LPARAM]
-        lib.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-        lib.GetClassNameW.restype = ctypes.c_int
-        lib.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-        lib.GetWindowTextW.restype = ctypes.c_int
-        lib.GetDlgCtrlID.argtypes = [wintypes.HWND]
-        lib.GetDlgCtrlID.restype = ctypes.c_int
-        lib.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
-                                                 ctypes.POINTER(wintypes.DWORD)]
-        lib.GetWindowThreadProcessId.restype = wintypes.DWORD
-        lib.IsWindow.argtypes = [wintypes.HWND]
-        lib.IsWindow.restype = wintypes.BOOL
         lib.IsWindowVisible.argtypes = [wintypes.HWND]
         lib.IsWindowVisible.restype = wintypes.BOOL
         lib.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
@@ -681,179 +635,6 @@ def _user32():
         lib.SetForegroundWindow.restype = wintypes.BOOL
         _USER32 = lib
     return _USER32
-
-
-def _hwnd_int(value) -> int:
-    """把回调里拿到的句柄参数统一成 ``int``（ctypes 可能给 int 或 ``c_void_p``）。"""
-    if value is None:
-        return 0
-    if isinstance(value, int):
-        return value
-    return int(getattr(value, "value", 0) or 0)
-
-
-def _send_msg(hwnd: int, msg: int, wparam: int = 0, lparam=None):
-    """``SendMessageW`` 的薄封装：走私有句柄，参数显式包成 ctypes 类型。"""
-    if lparam is None:
-        lparam = ctypes.c_void_p(0)
-    return _user32().SendMessageW(
-        wintypes.HWND(hwnd), wintypes.UINT(msg),
-        wintypes.WPARAM(wparam), lparam,
-    )
-
-
-def _find_file_dialog(allowed_pids=None) -> int:
-    """找微信弹出的原生「选择文件」对话框；没有则返回 0。
-
-    ``allowed_pids`` 给定时只认这些进程拥有的窗口。**必须给**：``#32770`` +
-    标题「打开」/「选择文件」是 Windows 通用对话框的固定长相，任何程序
-    （记事本、浏览器、别的工具）都会弹一模一样的窗口。认错窗口就会把文件路径
-    填到**别人**的对话框里——比发不出去糟得多。本机实测就撞到过：微信自己的
-    「选择文件」对话框还开着（上一次手工测试留下的），说明这种窗口确实会残留。
-    """
-    found: list[int] = []
-    u32 = _user32()
-    allowed = set(allowed_pids) if allowed_pids else None
-
-    def _cb(hwnd, _lparam):
-        try:
-            h = _hwnd_int(hwnd)
-            cls = ctypes.create_unicode_buffer(64)
-            u32.GetClassNameW(wintypes.HWND(h), cls, 64)
-            if cls.value != FILE_DIALOG_CLASS:
-                return True
-            title = ctypes.create_unicode_buffer(128)
-            u32.GetWindowTextW(wintypes.HWND(h), title, 128)
-            if title.value not in FILE_DIALOG_TITLES:
-                return True
-            if allowed is not None:
-                pid = wintypes.DWORD()
-                u32.GetWindowThreadProcessId(wintypes.HWND(h), ctypes.byref(pid))
-                if pid.value not in allowed:
-                    return True
-            found.append(h)
-            return False
-        except Exception:  # noqa: BLE001 - 枚举里单点失败不该中断整轮
-            pass
-        return True
-
-    try:
-        u32.EnumWindows(_WNDENUMPROC(_cb), 0)
-    except Exception as exc:
-        logger.debug(f"枚举文件对话框失败: {exc}")
-    return found[0] if found else 0
-
-
-def _dialog_child_by_id(parent: int, ctrl_id: int, cls: str = "") -> int:
-    """按控件 ID 在对话框里找子控件（可再用类名收窄）。"""
-    found: list[int] = []
-    u32 = _user32()
-
-    def _cb(hwnd, _lparam):
-        try:
-            h = _hwnd_int(hwnd)
-            if u32.GetDlgCtrlID(wintypes.HWND(h)) != ctrl_id:
-                return True
-            if cls:
-                name = ctypes.create_unicode_buffer(64)
-                u32.GetClassNameW(wintypes.HWND(h), name, 64)
-                if name.value != cls:
-                    return True
-            found.append(h)
-            return False
-        except Exception:  # noqa: BLE001
-            return True
-
-    try:
-        u32.EnumChildWindows(wintypes.HWND(parent), _WNDENUMPROC(_cb), 0)
-    except Exception as exc:
-        logger.debug(f"枚举对话框子控件失败: {exc}")
-    return found[0] if found else 0
-
-
-def _dialog_edit(dlg: int) -> int:
-    """定位文件名输入框：``ComboBoxEx32 → ComboBox → Edit``（通用对话框固定结构）。"""
-    u32 = _user32()
-
-    def _child(parent: int, cls: str) -> int:
-        return _hwnd_int(u32.FindWindowExW(wintypes.HWND(parent), None, cls, None))
-
-    combo_ex = _child(dlg, "ComboBoxEx32")
-    if combo_ex:
-        combo = _child(combo_ex, "ComboBox")
-        if combo:
-            edit = _child(combo, "Edit")
-            if edit:
-                return edit
-    return _dialog_child_by_id(dlg, FILE_DIALOG_EDIT_ID, "Edit")
-
-
-def _close_file_dialog(dlg: int) -> None:
-    """关掉原生文件对话框（收尾用，避免残留窗口挡住下一轮）。"""
-    try:
-        _send_msg(dlg, WM_CLOSE)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(f"关闭文件对话框失败: {exc}")
-
-
-def _get_dialog_text(hwnd: int) -> str:
-    """读控件文本（``WM_GETTEXTLENGTH`` + ``WM_GETTEXT``）。"""
-    length = int(_send_msg(hwnd, WM_GETTEXTLENGTH))
-    buf = ctypes.create_unicode_buffer(max(1, length) + 2)
-    _send_msg(hwnd, WM_GETTEXT, length + 1, ctypes.cast(buf, ctypes.c_void_p))
-    return buf.value
-
-
-#: 往文件对话框写路径的重试次数与间隔（秒）。
-FILE_DIALOG_SETTEXT_ATTEMPTS = 3
-FILE_DIALOG_SETTEXT_INTERVAL = 0.15
-
-
-def _set_dialog_text(hwnd: int, text: str, attempts: int = None) -> bool:
-    """用 ``WM_SETTEXT`` 写控件文本并**读回校验**（失败会重试几次）。
-
-    比 ``SendInput`` 逐字打路径快两个数量级（每字符 2 次系统调用），也不受输入法
-    干扰。
-
-    **为什么要重试**：0.8.10 上线后实测撞到过一次「读回校验不一致」——同一个
-    目录下的两个文件，前一个写入被吞掉、20 秒后的后一个一次成功。对话框刚弹出的
-    瞬间控件还没就绪，写入会丢。重试的代价只有几十毫秒，比直接退回剪贴板
-    （那条路要截屏找输入框）划算得多。
-    """
-    total = FILE_DIALOG_SETTEXT_ATTEMPTS if attempts is None else max(1, int(attempts))
-    last = None
-    for attempt in range(1, total + 1):
-        try:
-            _send_msg(hwnd, WM_SETTEXT, 0, ctypes.c_wchar_p(text))
-            last = _get_dialog_text(hwnd)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"写入文件对话框异常（第 {attempt}/{total} 次）: {exc}")
-            last = None
-        if last == text:
-            if attempt > 1:
-                logger.info(f"第 {attempt} 次写入文件对话框成功")
-            return True
-        logger.debug(
-            f"文件对话框读回不一致（第 {attempt}/{total} 次）："
-            f"期望 {text!r}，读回 {last!r}"
-        )
-        time.sleep(FILE_DIALOG_SETTEXT_INTERVAL)
-    # 把**读回值**写进日志：只写「失败」的话，下次再出问题还是查不出原因。
-    logger.warning(
-        f"往文件对话框写入路径失败：期望 {text!r}，读回 {last!r}"
-        f"（已试 {total} 次）"
-    )
-    return False
-
-
-def _click_dialog_control(hwnd: int) -> bool:
-    try:
-        _send_msg(hwnd, BM_CLICK)
-        return True
-    except Exception as exc:
-        logger.debug(f"点击对话框控件失败: {exc}")
-        return False
-
 
 def _ensure_wechat_visible(gui) -> bool:
     """确认微信主窗**真的可见**；不可见就恢复显示并置前。
@@ -889,38 +670,6 @@ def _ensure_wechat_visible(gui) -> bool:
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"恢复微信主窗显示失败（忽略，按可见继续）: {exc}")
         return True
-
-
-def _uia_find_button_center(uia, names) -> tuple[int, int] | None:
-    """在 UIA 树里按名字找按钮，返回其屏幕中心坐标；找不到返回 ``None``。"""
-    if uia is None:
-        return None
-    win = getattr(uia, "_win", None)
-    if win is None:
-        return None
-    try:
-        from wechatauto.uia_driver import _find_by
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(f"加载 UIA 遍历工具失败: {exc}")
-        return None
-    for name in names:
-        try:
-            btn = _find_by(
-                win,
-                lambda c, _n=name: (c.ControlTypeName == "ButtonControl"
-                                    and (c.Name or "") == _n),
-            )
-        except Exception:  # noqa: BLE001
-            btn = None
-        if btn is None:
-            continue
-        try:
-            rect = btn.BoundingRectangle
-            return ((int(rect.left) + int(rect.right)) // 2,
-                    (int(rect.top) + int(rect.bottom)) // 2)
-        except Exception:  # noqa: BLE001
-            continue
-    return None
 
 
 def _install_wechatauto_uia_compat() -> None:
@@ -1154,16 +903,6 @@ class WeChatBridge:
     #: 做决定——拦掉一个本来发得出去的文件，比白试一轮更糟。
     #: 设 0 表示不打这条告警。
     FILE_SEND_SIZE_WARN_MB = 100
-    #: 附件发送路线：
-    #:
-    #: * ``auto``（默认）——先试原生「选择文件」对话框路线，失败再回退剪贴板粘贴；
-    #: * ``dialog``——只用对话框路线（失败即失败，不回退）；
-    #: * ``clipboard``——只用剪贴板粘贴路线（0.8.9 及以前的行为）。
-    #:
-    #: 对话框路线**全程不截屏、不 OCR**：按钮坐标来自 UIA，路径用 ``WM_SETTEXT``
-    #: 直接写进原生对话框，实测约 1 秒完成。
-    FILE_SEND_MODE = "auto"
-    FILE_SEND_MODES = ("auto", "dialog", "clipboard")
     #: 视为「附件已落地」的消息类型（对应 wechatauto 的 MSG_TYPE_NAMES）。
     #: 图片=3、视频=43、文件/链接/卡片=49。视频消息正文里没有文件名，
     #: 只能像图片一样靠「类型 + 时序」判断。
@@ -3075,194 +2814,12 @@ class WeChatBridge:
                     return False
 
                 with LockManager.acquire():
-                    mode = self._file_send_mode()
-                    if mode in ("auto", "dialog"):
-                        if self._send_file_via_dialog(room_name, file_path):
-                            return True
-                        if mode == "dialog":
-                            logger.error(
-                                "文件对话框路线失败，且配置已禁用剪贴板兜底: "
-                                f"[{room_name}] {os.path.basename(file_path)}"
-                            )
-                            return False
-                        logger.warning(
-                            "文件对话框路线失败，回退剪贴板粘贴路线: "
-                            f"[{room_name}] {os.path.basename(file_path)}"
-                        )
                     return self._send_file_via_clipboard(room_name, file_path)
             result = self._wx.SendFiles(file_path, who=room_name)
             return result is None or bool(result)
         except Exception as exc:
             logger.error(f"发送文件异常: {exc}")
             return False
-
-    def _file_send_mode(self) -> str:
-        """当前附件发送路线；取值非法时按 ``auto`` 处理。"""
-        mode = str(getattr(self, "FILE_SEND_MODE", "auto") or "auto").strip().lower()
-        return mode if mode in self.FILE_SEND_MODES else "auto"
-
-    def apply_file_send_mode(self, mode: str) -> None:
-        """供适配层按配置热更新附件发送路线。"""
-        text = str(mode or "auto").strip().lower()
-        if text not in self.FILE_SEND_MODES:
-            logger.warning(f"未知的附件发送路线 {mode!r}，按 auto 处理")
-            text = "auto"
-        if text != getattr(self, "FILE_SEND_MODE", ""):
-            logger.info(f"附件发送路线已切换为 {text}")
-        self.FILE_SEND_MODE = text
-
-    @staticmethod
-    def _click_file_button(uia, gui, center: tuple[int, int]) -> bool:
-        """点「发送文件」按钮：优先走 UIA 的点击（会临时摘掉渲染层的
-        ``WS_EX_TRANSPARENT``，否则点击会穿透过去），拿不到就退回 ``wx_click``。
-        """
-        x, y = int(center[0]), int(center[1])
-        clicker = getattr(uia, "_click_at", None) if uia is not None else None
-        try:
-            if callable(clicker):
-                clicker(x, y)
-            else:
-                gui.wx_click(x, y)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"点击「发送文件」按钮失败: {exc}")
-            return False
-
-    @staticmethod
-    def _wait_file_dialog(allowed_pids=None) -> int:
-        """轮询等原生文件对话框出现；超时返回 0。"""
-        deadline = time.time() + FILE_DIALOG_TIMEOUT_SECONDS
-        while time.time() < deadline:
-            dlg = _find_file_dialog(allowed_pids)
-            if dlg:
-                return dlg
-            time.sleep(FILE_DIALOG_POLL_INTERVAL)
-        return 0
-
-    def _wechat_pids(self, gui) -> set[int]:
-        """已知属于微信的进程号，用于确认弹出的对话框确实是微信的。"""
-        pids = {int(p) for p in (getattr(self, "_window_process_ids", None) or ()) if p}
-        pid = int(getattr(gui, "pid", 0) or 0)
-        if pid:
-            pids.add(pid)
-        return pids
-
-    @staticmethod
-    def _ensure_chat_open(gui, room_name: str) -> bool:
-        """确保**目标会话就是当前打开的会话**。
-
-        这一步不能省：剪贴板路线（``guia.send_file``）自带切会话——它先
-        ``_open_chat_and_settle(who)`` 再粘贴。而「发送文件」按钮只会把附件塞进
-        **当前**会话，不认「目标是谁」。少了这一步，附件就会被发到发消息时恰好
-        打开的那个聊天里，比发不出去更糟。
-
-        ``gui.open_chat`` 内部已经优先走 UIA，只有 UIA 不可用时才回落 OCR 侧栏。
-        """
-        get_input_box = getattr(gui, "get_input_box", None)
-        current = getattr(gui, "_current_chat", None)
-        if current == room_name and callable(get_input_box) and get_input_box():
-            return True
-        opener = getattr(gui, "_open_chat_and_settle", None)
-        if not callable(opener):
-            opener = getattr(gui, "open_chat", None)
-        if not callable(opener):
-            logger.warning("拿不到切会话的入口，无法保证附件发到目标聊天")
-            return False
-        try:
-            return bool(opener(room_name))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"打开目标会话失败: [{room_name}] {exc}")
-            return False
-
-    def _send_file_via_dialog(self, room_name: str, file_path: str) -> bool:
-        """原生对话框路线：UIA 点「发送文件」→ ``WM_SETTEXT`` 填路径 → 点「打开」。
-
-        为什么值得单独做一条路线：剪贴板路线要「探输入框（像素）→ 写 CF_HDROP
-        → 等微信把原始文件拷进自己的目录 → 按回车」，任何一步时序错位都会静默
-        失败，而且它依赖像素探测，窗口一被缩到托盘就全盘失效。这条路**全程
-        不碰像素**：按钮坐标由 UIA 直接给出，对话框是系统标准控件，路径用
-        ``WM_SETTEXT`` 一次写入。实测约 1 秒完成、0 次截屏、0 次 OCR。
-
-        返回 ``False`` 表示「这条路线没走通」，调用方（``auto`` 模式）会回退到
-        剪贴板路线——所以这里的失败日志一律用 ``warning`` 而不是 ``error``。
-        """
-        gui = getattr(self._wx, "_gui", None)
-        if gui is None:
-            logger.warning("拿不到 WeChatGUI，无法走文件对话框路线")
-            return False
-        # 窗口缩在托盘里时点击会落到别的程序上，必须先确保它真的可见。
-        if not _ensure_wechat_visible(gui):
-            logger.warning("微信主窗不可见，放弃文件对话框路线")
-            return False
-        # 「发送文件」按钮只作用于当前会话，必须先切到目标会话。
-        if not self._ensure_chat_open(gui, room_name):
-            logger.warning(f"无法打开目标会话，放弃文件对话框路线: [{room_name}]")
-            return False
-
-        uia = None
-        try:
-            uia = gui._get_uia()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"获取 UIA 失败: {exc}")
-        center = _uia_find_button_center(uia, FILE_BUTTON_NAMES)
-        if center is None:
-            logger.warning("在微信界面上找不到「发送文件」按钮，本路线不可用")
-            return False
-
-        # 清掉可能残留的旧对话框（上一轮超时留下的），避免把路径填进错的窗口。
-        # 只认微信进程的窗口——别的程序也会弹同名的「打开」对话框。
-        pids = self._wechat_pids(gui) or None
-        stale = _find_file_dialog(pids)
-        if stale:
-            logger.warning("发现残留的文件对话框，先关掉再继续")
-            _close_file_dialog(stale)
-            time.sleep(0.3)
-
-        before_seq = self._target_seq(room_name)
-        if not self._click_file_button(uia, gui, center):
-            return False
-
-        dlg = self._wait_file_dialog(pids)
-        if not dlg:
-            logger.warning("点了「发送文件」但原生对话框没有出现（点击可能没命中）")
-            return False
-
-        edit = _dialog_edit(dlg)
-        if not edit:
-            logger.warning("文件对话框里找不到文件名输入框")
-            _close_file_dialog(dlg)
-            return False
-        if not _set_dialog_text(edit, file_path):
-            # 具体读回值已由 _set_dialog_text 记在上一行，这里不重复报。
-            _close_file_dialog(dlg)
-            return False
-
-        ok = (_dialog_child_by_id(dlg, FILE_DIALOG_OK_ID, "Button")
-              or _dialog_child_by_id(dlg, FILE_DIALOG_OK_ID))
-        if not ok or not _click_dialog_control(ok):
-            logger.warning("文件对话框里找不到「打开」按钮")
-            _close_file_dialog(dlg)
-            return False
-        logger.info(
-            f"已通过文件对话框提交附件: [{room_name}] "
-            f"{os.path.basename(file_path)}"
-        )
-
-        if self._confirm_file_sent(room_name, before_seq):
-            return True
-        # 微信把附件放进了输入框但没自动发出去 → 补按回车（草稿还在就发出，
-        # 输入框已空则回车无副作用，不会重复发送）。
-        if self._nudge_enter_until_confirmed(room_name, before_seq):
-            logger.info(
-                f"补按回车后发送成功（对话框路线）: [{room_name}] "
-                f"{os.path.basename(file_path)}"
-            )
-            return True
-        logger.warning(
-            "文件对话框路线未在数据库中得到确认: "
-            f"[{room_name}] {os.path.basename(file_path)}"
-        )
-        return False
 
     def _send_file_via_clipboard(self, room_name: str, file_path: str) -> bool:
         """剪贴板粘贴路线（0.8.9 及以前的行为）：``SendFiles`` + 数据库回查确认。

@@ -2,6 +2,59 @@
 
 本项目遵循语义化版本号。日期格式为 `YYYY-MM-DD`。
 
+## [0.8.12] - 2026-10-07
+
+**紧急修复：0.8.10 引入的「发送文件」按钮路线会让微信崩溃。** 已默认关闭。
+
+### 修复 · 「发送文件」对话框路线导致微信崩溃（两次）
+
+0.8.10 换掉了「猜坐标 + 剪贴板」的发送路，改成点微信的「发送文件」按钮、
+在弹出的系统对话框里用 `WM_SETTEXT` 填路径。上线后实测**两次微信崩溃**，
+每次都在「发送文件」这条路上：
+
+| | 第一次 | 第二次 |
+|---|---|---|
+| 开始发送 | 17:00:11 | 17:06:28 |
+| 崩溃转储落盘 | **17:00:19.6** | **17:06:36.1** |
+| 记录「写入路径失败」 | 17:00:30.9 | 17:06:46.9 |
+| 记录「微信窗口不可见」 | 17:00:35.3 | 17:06:51.3 |
+
+崩溃转储（`%APPDATA%\Tencent\xwechat\crashinfo\reports\`）两份完全同形：
+
+- 异常码 `0xC0000005`（访问冲突），**空指针读**
+- fault 地址 `0x7FFAEBDC2828` = **`comdlg32.dll+0x12828`**（两份一模一样）
+- 调用链：`USER32!DispatchMessage → comdlg32 → SHELL32 → Weixin.dll+0xB81C3C
+  → comdlg32 → 崩溃`
+
+`comdlg32.dll` 就是 Windows 的通用文件对话框库，`Weixin.dll` 出现在链中间说明
+微信自己 subclass 了那个对话框。**炸点在微信自己的代码里，我们改不了。**
+
+注意时间差：转储在 17:00:19.6 落盘，而「写入路径失败」是 17:00:30.9 —— 崩溃发生
+在 `_set_dialog_text` 的重试**进行中**，`WM_CLOSE` 根本还没发出去。所以元凶就是
+`WM_SETTEXT`/`WM_GETTEXT` 这几个跨进程消息，不是关对话框。
+
+修复：**把「发送文件」对话框路线整个删掉**，附件发送回到剪贴板路线。
+
+- 删除模块级：`_find_file_dialog` / `_dialog_child_by_id` / `_dialog_edit` /
+  `_close_file_dialog` / `_get_dialog_text` / `_set_dialog_text` /
+  `_click_dialog_control` / `_uia_find_button_center` / `_send_msg` / `_hwnd_int`
+  及 `FILE_*` / `WM_*` / `BM_CLICK` / `_WNDENUMPROC` 等常量。
+- 删除 `WeChatBridge` 上的：`_send_file_via_dialog` / `_click_file_button` /
+  `_wait_file_dialog` / `_wechat_pids` / `_ensure_chat_open` /
+  `_file_send_mode` / `apply_file_send_mode` 与 `FILE_SEND_MODE(S)` 常量。
+- 删除配置项 `link_file_send_mode`（`BotConfig`）、适配层的
+  `apply_file_send_mode` / `_apply_file_send_mode`、引擎的 `_push_file_send_mode`
+  以及界面上那个下拉框。
+- `_send_file_sync` 直接走 `_send_file_via_clipboard`，不再有路线分支。
+- 保留 `_ensure_wechat_visible` 与它用到的私有 user32 句柄（剪贴板路线同样需要
+  先确认主窗可见），对应的测试改名为 `WeChatWindowVisibilityTests`。
+
+### 变更
+
+- 测试 415 → **377** 项：删掉 38 项只为对话框路线写的测试
+  （`FileDialogRouteTests` / `DialogSetTextTests` / `PrivateUser32Tests` /
+  `FileSendModeWiringTests` 及适配层的 4 项路线测试）。
+
 ## [0.8.11] - 2026-10-07
 
 0.8.10 上线后翻实机日志翻出来的三个问题。都是「不影响主流程、但一旦出问题就
