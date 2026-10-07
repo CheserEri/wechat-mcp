@@ -1935,6 +1935,46 @@ class BridgeFileSendConfirmTests(unittest.TestCase):
             self.assertFalse(bridge._send_file_sync("群聊", self._tmp_file(tmp)))
         self.assertEqual(calls["n"], 1, "落库未确认时不得重发（会重复发送）")
 
+    def test_refuses_oversize_attachment_without_attempting(self):
+        """超过微信单文件上限 → 动手前就拒发，一次 SendFiles 都不该调用。
+
+        微信对超限文件是弹「文件过大」直接拒收，而粘贴路线下这个拒收不会
+        变成异常/失败返回值。白试一轮只会占着发送闸门几十秒。
+        """
+        module = self._module()
+        fake = _FakeWxDb(seq=100, new=[])
+        wx, calls = self._counting_wx(module, [None], fake)
+        bridge = self._bridge(module, wx)
+        bridge.FILE_SEND_SIZE_LIMIT_MB = 1
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "big.mp4"
+            target.write_bytes(b"x" * (1024 * 1024 + 1))  # 略超 1 MB
+            self.assertFalse(bridge._send_file_sync("群聊", str(target)))
+        self.assertEqual(calls["n"], 0, "超限文件不应尝试发送")
+
+    def test_oversize_reason_allows_sendable_file(self):
+        """正常体积返回空串（可发送）；0 表示不做限制。"""
+        module = self._module()
+        bridge = self._bridge(module, SimpleNamespace(_db=None))
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "small.mp4"
+            target.write_bytes(b"x" * 1024)
+            self.assertEqual(bridge._oversize_reason(str(target)), "")
+            bridge.FILE_SEND_SIZE_LIMIT_MB = 0
+            self.assertEqual(bridge._oversize_reason(str(target)), "")
+
+    def test_oversize_reason_reports_size(self):
+        """超限时原因里要带上实际体积与上限，便于直接看懂日志。"""
+        module = self._module()
+        bridge = self._bridge(module, SimpleNamespace(_db=None))
+        bridge.FILE_SEND_SIZE_LIMIT_MB = 1
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "big.mp4"
+            target.write_bytes(b"x" * (2 * 1024 * 1024))
+            reason = bridge._oversize_reason(str(target))
+        self.assertIn("2.0 MB", reason)
+        self.assertIn("1 MB", reason)
+
 
 class _FakeGui:
     """只实现 `_strict_input_box` 用到的那几个方法。"""

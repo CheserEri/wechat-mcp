@@ -698,6 +698,13 @@ class WeChatBridge:
     #: 附件压根没粘上去（典型是输入框定位失败），重发不会重复。若只是数据库
     #: 没确认（可能落库慢），一律不重试，避免同一附件发两遍。
     FILE_SEND_ATTEMPTS = 2
+    #: 微信 PC 端单文件硬上限（MB）。**这是微信自己的限制，不是可调偏好**：
+    #: 超过它微信会弹「文件过大」直接拒收（视频类更严），而粘贴路线下这个
+    #: 拒绝不会变成异常、也不会变成失败返回值，只表现为「聊天里什么都没多
+    #: 出来」。所以动手前先自己拦掉，省掉一轮「30 秒 + 体积秒数」的发送超时。
+    #: 注意 `link_download_max_mb` 默认 100 与之对齐，别把它调得比这更大，
+    #: 否则会下载一堆注定发不出去的文件。
+    FILE_SEND_SIZE_LIMIT_MB = 100
     #: 视为「附件已落地」的消息类型（对应 wechatauto 的 MSG_TYPE_NAMES）。
     #: 图片=3、视频=43、文件/链接/卡片=49。视频消息正文里没有文件名，
     #: 只能像图片一样靠「类型 + 时序」判断。
@@ -2544,6 +2551,29 @@ class WeChatBridge:
             else:
                 logger.error(f"文件后台确认发送失败: [{room_name}] {file_path}")
 
+    def _oversize_reason(self, file_path: str) -> str:
+        """附件超过微信单文件上限时返回原因，否则返回空串。
+
+        微信 PC 端（含 4.x）单文件上限 **100 MB**，视频类更严；超限时微信弹
+        「文件过大」并拒收。走剪贴板粘贴路线时这个拒绝**既不是异常也不是失败
+        返回值**，只表现为「聊天里什么都没多出来」，所以要自己先拦。
+
+        ``FILE_SEND_SIZE_LIMIT_MB`` <= 0 表示不做限制（留给需要试大文件的场景）。
+        """
+        limit = int(getattr(self, "FILE_SEND_SIZE_LIMIT_MB", 0) or 0)
+        if limit <= 0:
+            return ""
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            return ""
+        if size <= limit * 1024 * 1024:
+            return ""
+        return (
+            f"文件 {size / 1048576:.1f} MB 超过微信单文件上限 {limit} MB，"
+            "微信会直接拒收，本次不再尝试发送"
+        )
+
     def _send_file_sync(self, room_name: str, file_path: str) -> bool:
         """同步发送文件：走 wxauto 的 SendFiles，并在发送后回查数据库确认。
 
@@ -2557,8 +2587,17 @@ class WeChatBridge:
         去（典型是输入框定位失败，见 :func:`_install_wechatauto_input_box_guard`），
         重发是安全的。反过来，如果操作执行了、只是**数据库没确认**，那可能只是
         落库慢，重试有重复发送的风险，所以直接判失败、不再重试。
+
+        **体积闸门**：超过微信单文件上限（见 ``FILE_SEND_SIZE_LIMIT_MB``）的直接
+        拒发——微信自己就不收，白试一轮只会拖住发送闸门几十秒。
         """
         try:
+            oversize = self._oversize_reason(file_path)
+            if oversize:
+                logger.error(
+                    f"拒绝发送：{oversize} [{room_name}] {os.path.basename(file_path)}"
+                )
+                return False
             if self._backend == "wechatauto":
                 from wechatauto.utils.lock import LockManager
 
