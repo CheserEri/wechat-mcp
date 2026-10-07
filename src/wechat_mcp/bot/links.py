@@ -2,8 +2,10 @@
 
 设计要点
 --------
-- **媒体站点**（YouTube / Bilibili / 抖音 …）走 yt-dlp 的 ``extract_info``
+- **媒体站点**（YouTube / Bilibili 等）走 yt-dlp 的 ``extract_info``
   （``skip_download=True``，只取元数据）。
+- **抖音**单独走浏览器桥（见 :mod:`wechat_mcp.bot.douyin`）：它的接口要求
+  ``a_bogus`` 签名，内置 yt-dlp 没实现，网页兜底也只能拿到空壳。
 - **普通网页**回退到直接抓取 ``<title>`` 与 ``meta description``。
 - 结果按 URL **缓存**（成功永久、失败带 TTL 允许重试），重复出现不再请求。
 - yt-dlp 是阻塞调用，统一放到线程池执行，避免卡住事件循环。
@@ -29,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import tweet
+from . import douyin, tweet
 
 # --------------------------------------------------------------------------- #
 # URL 检测
@@ -213,13 +215,16 @@ _COOKIE_HINT_RE = re.compile(
 def _cookie_hint(detail: str) -> str:
     """把「缺 Cookie」这类失败翻译成人话，提示用户去配 cookies.txt。
 
-    抖音、微博、小红书等站点会对未带 Cookie 的请求返回 403，yt-dlp 的原话是
+    微博、小红书等站点会对未带 Cookie 的请求返回 403，yt-dlp 的原话是
     ``Fresh cookies (not necessarily logged in) are needed``——不翻译的话，
     用户只看到「未能提取标题」，根本不知道该做什么。
+
+    注意**抖音不在此列**：它另有 ``a_bogus`` 签名这道门槛，配 Cookie 也解不开，
+    已改走浏览器桥（见 :mod:`wechat_mcp.bot.douyin`）。
     """
     if _COOKIE_HINT_RE.search(detail or ""):
         return (
-            "该站点需要浏览器 Cookie 才能解析（抖音/微博/小红书等常见）；"
+            "该站点需要浏览器 Cookie 才能解析（微博/小红书等常见）；"
             "请在「链接解析」页设置 cookies.txt 路径"
         )
     return ""
@@ -611,11 +616,16 @@ class LinkResolver:
             info = _tweet_link_info(url, self.timeout, self._log)
             if info is not None:
                 return info
-        module = load_yt_dlp()
         target, expand_error = self._expand_short_link(url)
         if expand_error:
             return LinkInfo(url=url, ok=False, error=expand_error)
         lookup = target or url
+        if douyin.is_douyin_url(lookup):
+            # 抖音单独走浏览器桥：接口要 a_bogus 签名，内置 yt-dlp 没有实现，
+            # 网页兜底又只能拿到空壳（正文由 JS 渲染），两条路都必然失败。
+            # 放在 load_yt_dlp() 之前，省掉一次没用的 yt-dlp 加载。
+            return _rekey(self._douyin_link_info(lookup), url, lookup)
+        module = load_yt_dlp()
         ytdlp_info: LinkInfo | None = None
         if module is not None:
             ytdlp_info = self._extract_with_ytdlp(module, lookup)
@@ -633,6 +643,32 @@ class LinkResolver:
                 detail = f"{detail}（网页兜底：{page_info.error}）"
             page_info.error = detail
         return _rekey(page_info, url, lookup)
+
+    def _douyin_link_info(self, url: str) -> LinkInfo:
+        """抖音解析：交给浏览器桥（见 :mod:`wechat_mcp.bot.browser`）。"""
+        aweme_id = douyin.extract_aweme_id(url)
+        if not aweme_id:
+            return LinkInfo(url=url, ok=False, error="未能从抖音链接中识别作品 ID")
+        video = douyin.video_for(aweme_id, logger=self._log, timeout=self.timeout)
+        if not video.ok:
+            return LinkInfo(url=url, ok=False, error=video.error or "抖音解析失败")
+        if video.is_images:
+            meta = f"类型：图文（{len(video.images)} 张）"
+        else:
+            meta = "类型：视频"
+        return LinkInfo(
+            url=url,
+            ok=True,
+            title=video.title,
+            uploader=video.uploader,
+            duration=video.duration,
+            description=video.description,
+            extractor="抖音",
+            is_media=True,
+            webpage_url=url,
+            label="抖音",
+            meta=meta,
+        )
 
     def _extract_with_ytdlp(self, module: Any, url: str) -> LinkInfo:
         options = {
@@ -734,16 +770,19 @@ class LinkResolver:
         )
 
     def _download_sync(self, url: str, outdir: str, max_mb: int) -> str | None:
-        module = load_yt_dlp()
-        if module is None:
-            self._log("error", "内置 yt-dlp 不可用，无法下载链接内容。")
-            return None
         # 短链（如 b23.tv）yt-dlp 无法直接下载，先展开成真实地址。
         target, expand_error = self._expand_short_link(url)
         if expand_error:
             self._log("warning", f"下载链接内容失败 {url}：{expand_error}")
             return None
         url = target or url
+        if douyin.is_douyin_url(url):
+            # 抖音不经过 yt-dlp（缺 a_bogus 签名），直接下 play_addr 直链。
+            return self._download_douyin(url, outdir, max_mb)
+        module = load_yt_dlp()
+        if module is None:
+            self._log("error", "内置 yt-dlp 不可用，无法下载链接内容。")
+            return None
         try:
             Path(outdir).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -815,3 +854,35 @@ class LinkResolver:
             if candidate and Path(candidate).is_file():
                 return candidate
         return _newest_new_file(outdir, before)
+
+    def _download_douyin(self, url: str, outdir: str, max_mb: int) -> str | None:
+        """下载抖音作品：拿 ``play_addr`` 直链直接下（不经过 yt-dlp）。"""
+        aweme_id = douyin.extract_aweme_id(url)
+        if not aweme_id:
+            self._log("warning", f"下载抖音内容失败 {url}：未能识别作品 ID")
+            return None
+        # 直链带时效：先用缓存里的，失败后强制重取一次再试。
+        for force in (False, True):
+            video = douyin.video_for(
+                aweme_id, logger=self._log, timeout=self.timeout, force=force
+            )
+            if not video.ok:
+                self._log("warning", f"下载抖音内容失败 {url}：{video.error}")
+                return None
+            if not video.video_url:
+                self._log(
+                    "info",
+                    f"抖音图文作品暂不支持下载（{len(video.images)} 张图片）：{url}",
+                )
+                return None
+            path = douyin.download_video(
+                video.video_url,
+                outdir,
+                filename=video.title or f"douyin_{aweme_id}",
+                timeout=max(self.timeout, 30.0),
+                max_bytes=max_mb * 1024 * 1024 if max_mb > 0 else 0,
+                logger=self._log,
+            )
+            if path:
+                return path
+        return None

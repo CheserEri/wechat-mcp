@@ -112,8 +112,9 @@ class BotConfig:
     # 单个链接的解析超时（秒）。
     link_parse_timeout: float = 20.0
     # Netscape 格式 cookies.txt 的路径（留空 = 不使用）。
-    # 抖音、微博、小红书等站点会对未带 Cookie 的请求返回 403，yt-dlp 明确要求
+    # 微博、小红书等站点会对未带 Cookie 的请求返回 403，yt-dlp 明确要求
     # 「新鲜 cookie（不必登录）」；用浏览器扩展导出一次 cookies.txt 填到这里即可。
+    # 注意**抖音不需要**：它另有 a_bogus 签名门槛，走浏览器桥解决（见 bot/douyin.py）。
     link_cookies_file: str = ""
     # 下载音视频并发回当前聊天。默认**关闭**：会向真实聊天发送文件。
     link_download_enabled: bool = False

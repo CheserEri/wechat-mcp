@@ -71,6 +71,9 @@ hiddenimports = [
     # 自动收集它用到的全部标准库子模块（html.parser / urllib.request …）与
     # 940 个提取器；其官方 hook 另在下方 hookspath 中启用。
     "yt_dlp",
+    # 抖音解析的浏览器桥：douyin.py 里是函数内惰性导入，静态分析未必扫到，
+    # 漏掉会在冻结包里报 ModuleNotFoundError（只依赖标准库，不增加体积）。
+    "wechat_mcp.bot.browser",
 ]
 
 for _pkg in (

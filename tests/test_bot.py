@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 import time
@@ -18,6 +19,8 @@ from wechat_mcp.adapters.deepseekgirl import (
     _looks_like_chat_id,
 )
 from wechat_mcp.bot import BotConfig, BotEngine, get_persona, reset_persona
+from wechat_mcp.bot import browser as browser_mod
+from wechat_mcp.bot import douyin as douyin_mod
 from wechat_mcp.bot import links as links_mod
 from wechat_mcp.bot.links import LinkInfo, extract_urls, format_link_block
 from wechat_mcp.bot.llm import LLMClient, LLMError
@@ -1753,6 +1756,333 @@ class ShortLinkTests(unittest.TestCase):
             ):
                 resolver._download_sync("https://b23.tv/abc", tmp, 0)
         self.assertEqual(seen["url"], "https://www.bilibili.com/video/BV1xx411c7mD")
+
+
+class BrowserBridgeTests(unittest.TestCase):
+    """浏览器桥里不依赖真实浏览器的部分。"""
+
+    def _make(self, suffix, age):
+        path = Path(tempfile.gettempdir()) / (browser_mod._PROFILE_PREFIX + suffix)
+        path.mkdir(exist_ok=True)
+        stamp = time.time() - age
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_sweep_removes_stale_and_keeps_fresh(self):
+        stale = self._make("unittest-stale", browser_mod._PROFILE_STALE_SECONDS + 60)
+        fresh = self._make("unittest-fresh", 5)
+        other = Path(tempfile.gettempdir()) / "wechat-mcp-unrelated"
+        other.mkdir(exist_ok=True)
+        try:
+            browser_mod._sweep_stale_profiles()
+            self.assertFalse(stale.exists(), "过期目录应被清掉")
+            self.assertTrue(fresh.exists(), "新目录不能误删")
+            self.assertTrue(other.exists(), "前缀不匹配的目录不能碰")
+        finally:
+            for path in (stale, fresh, other):
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+
+    def test_sweep_uses_owner_pid(self):
+        """目录名里的 PID 还活着就不能删（同机另一个实例可能正在用）。"""
+        alive = Path(tempfile.gettempdir()) / (
+            f"{browser_mod._PROFILE_PREFIX}{os.getpid()}-unittest-alive"
+        )
+        dead = Path(tempfile.gettempdir()) / (
+            f"{browser_mod._PROFILE_PREFIX}999999-unittest-dead"
+        )
+        for path in (alive, dead):
+            path.mkdir(exist_ok=True)
+        try:
+            browser_mod._sweep_stale_profiles()
+            self.assertTrue(alive.exists(), "自己的进程还在，目录不能删")
+            self.assertFalse(dead.exists(), "PID 已不在的目录应被清掉")
+        finally:
+            for path in (alive, dead):
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+
+
+class DouyinTests(unittest.TestCase):
+    """抖音：域名识别、作品 ID、详情解析、浏览器桥与缓存。
+
+    这里**不真的启动浏览器**——所有触网/起进程的入口都打桩。
+    """
+
+    def tearDown(self):
+        douyin_mod.forget_cached()
+
+    def test_is_douyin_url(self):
+        self.assertTrue(douyin_mod.is_douyin_url("https://www.douyin.com/video/1234567890456"))
+        self.assertTrue(douyin_mod.is_douyin_url("https://v.douyin.com/iRabcdef/"))
+        self.assertTrue(
+            douyin_mod.is_douyin_url("https://www.iesdouyin.com/share/video/123456")
+        )
+        self.assertFalse(douyin_mod.is_douyin_url("https://example.com/douyin.com"))
+        self.assertFalse(douyin_mod.is_douyin_url(""))
+
+    def test_extract_aweme_id(self):
+        cases = {
+            "https://www.douyin.com/video/7693096156315005922": "7693096156315005922",
+            "https://www.douyin.com/note/7693096156315005922": "7693096156315005922",
+            "https://www.douyin.com/slides/7693096156315005922": "7693096156315005922",
+            "https://www.iesdouyin.com/share/video/7693096156315005922/?a=1": (
+                "7693096156315005922"
+            ),
+            "https://www.douyin.com/user/xyz?modal_id=7693096156315005922": (
+                "7693096156315005922"
+            ),
+            "https://www.douyin.com/7693096156315005922": "7693096156315005922",
+            "https://v.douyin.com/iRabcdef/": "",
+        }
+        for url, expected in cases.items():
+            self.assertEqual(douyin_mod.extract_aweme_id(url), expected, url)
+
+    def test_parse_detail_video(self):
+        detail = {
+            "aweme_id": "1",
+            "desc": "标题",
+            "author": {"nickname": "作者"},
+            "video": {
+                "duration": 12167,
+                "play_addr": {"url_list": ["https://v/1.mp4"]},
+            },
+        }
+        video = douyin_mod.parse_detail(detail)
+        self.assertTrue(video.ok)
+        self.assertEqual(video.title, "标题")
+        self.assertEqual(video.uploader, "作者")
+        self.assertEqual(video.duration, 12)
+        self.assertEqual(video.video_url, "https://v/1.mp4")
+        self.assertFalse(video.is_images)
+
+    def test_parse_detail_prefers_highest_bitrate(self):
+        detail = {
+            "aweme_id": "1",
+            "video": {
+                "duration": 1000,
+                "play_addr": {"url_list": ["https://fallback.mp4"]},
+                "bit_rate": [
+                    {"bit_rate": 100, "play_addr": {"url_list": ["https://low.mp4"]}},
+                    {"bit_rate": 900, "play_addr": {"url_list": ["https://high.mp4"]}},
+                ],
+            },
+        }
+        self.assertEqual(douyin_mod.parse_detail(detail).video_url, "https://high.mp4")
+
+    def test_parse_detail_images_is_not_video(self):
+        detail = {
+            "aweme_id": "1",
+            "desc": "图文",
+            "images": [
+                {"url_list": ["https://i1.jpg", "https://i1-big.jpg"]},
+                {"url_list": ["https://i2.jpg"]},
+            ],
+            "video": {},
+        }
+        video = douyin_mod.parse_detail(detail)
+        self.assertTrue(video.ok)
+        self.assertTrue(video.is_images)
+        self.assertEqual(len(video.images), 2)
+        # 每张图取 url_list 的最后一个（通常分辨率最高）
+        self.assertEqual(video.images[0], "https://i1-big.jpg")
+
+    def test_fetch_via_browser_without_browser(self):
+        with mock.patch.object(browser_mod, "browser_available", lambda: False):
+            video = douyin_mod.fetch_video_via_browser("123")
+        self.assertFalse(video.ok)
+        self.assertIn("Chrome", video.error)
+
+    def test_fetch_via_browser_without_id(self):
+        video = douyin_mod.fetch_video_via_browser("")
+        self.assertFalse(video.ok)
+        self.assertIn("作品 ID", video.error)
+
+    def test_fetch_via_browser_returns_detail(self):
+        """整条浏览器流程打桩：只验证「导航→轮询→解析」的编排。"""
+        payload = {
+            "aweme_detail": {
+                "aweme_id": "123",
+                "desc": "标题",
+                "author": {"nickname": "作者"},
+                "video": {"duration": 5000, "play_addr": {"url_list": ["https://v/1.mp4"]}},
+            }
+        }
+        calls = {"xhr": 0, "navigate": "", "closed": False}
+
+        class _FakePage:
+            def start(self):
+                return self
+
+            def navigate(self, url):
+                calls["navigate"] = url
+
+            def wait_for(self, condition, timeout=20.0):
+                return True
+
+            def xhr_get(self, path, timeout_ms=15000):
+                calls["xhr"] += 1
+                if calls["xhr"] == 1:
+                    return 403, "Blocked by ArgusSecurityPlugin Uifid Not Found"
+                return 200, json.dumps(payload)
+
+            def close(self, blocking=True):
+                calls["closed"] = True
+
+        with mock.patch.object(browser_mod, "browser_available", lambda: True), \
+             mock.patch.object(browser_mod, "BrowserSession", lambda **kw: _FakePage()):
+            video = douyin_mod.fetch_video_via_browser("123")
+
+        self.assertTrue(video.ok)
+        self.assertEqual(video.title, "标题")
+        self.assertEqual(video.video_url, "https://v/1.mp4")
+        self.assertEqual(calls["xhr"], 2)  # 第一次 403，重试后成功
+        self.assertIn("/video/123", calls["navigate"])
+        self.assertTrue(calls["closed"])
+
+    def test_video_for_caches_success(self):
+        calls = []
+
+        def fake(aweme_id, **kwargs):
+            calls.append(aweme_id)
+            return douyin_mod.DouyinVideo(aweme_id=aweme_id, ok=True, title="T")
+
+        with mock.patch.object(douyin_mod, "fetch_video_via_browser", fake):
+            first = douyin_mod.video_for("42")
+            second = douyin_mod.video_for("42")
+        self.assertIs(first, second)
+        self.assertEqual(calls, ["42"])
+
+    def test_video_for_does_not_cache_failure(self):
+        calls = []
+
+        def fake(aweme_id, **kwargs):
+            calls.append(aweme_id)
+            return douyin_mod.DouyinVideo(aweme_id=aweme_id, ok=False, error="x")
+
+        with mock.patch.object(douyin_mod, "fetch_video_via_browser", fake):
+            douyin_mod.video_for("43")
+            douyin_mod.video_for("43")
+        self.assertEqual(calls, ["43", "43"])
+
+    def test_video_for_force_bypasses_cache(self):
+        calls = []
+
+        def fake(aweme_id, **kwargs):
+            calls.append(aweme_id)
+            return douyin_mod.DouyinVideo(aweme_id=aweme_id, ok=True, title="T")
+
+        with mock.patch.object(douyin_mod, "fetch_video_via_browser", fake):
+            douyin_mod.video_for("44")
+            douyin_mod.video_for("44", force=True)
+        self.assertEqual(calls, ["44", "44"])
+
+
+class DouyinLinkTests(unittest.TestCase):
+    """抖音在 links.py 里的接线：解析走浏览器桥，下载走 play_addr 直链。"""
+
+    def tearDown(self):
+        douyin_mod.forget_cached()
+
+    def test_resolve_routes_to_browser_bridge(self):
+        resolver = links_mod.LinkResolver()
+        video = douyin_mod.DouyinVideo(
+            aweme_id="123",
+            ok=True,
+            title="标题",
+            uploader="作者",
+            duration=12,
+            description="简介",
+            video_url="https://v/1.mp4",
+        )
+        with mock.patch.object(douyin_mod, "video_for", lambda *a, **k: video), \
+             mock.patch.object(
+                 links_mod, "load_yt_dlp", side_effect=AssertionError("不该加载 yt-dlp")
+             ):
+            info = resolver._resolve_sync("https://www.douyin.com/video/1234567890")
+        self.assertTrue(info.ok)
+        self.assertEqual(info.label, "抖音")
+        self.assertEqual(info.title, "标题")
+        self.assertEqual(info.uploader, "作者")
+        self.assertEqual(info.duration, 12)
+        self.assertEqual(info.extractor, "抖音")
+        self.assertEqual(info.meta, "类型：视频")
+        self.assertIn("[抖音]", info.summary())
+
+    def test_resolve_images_marks_type(self):
+        resolver = links_mod.LinkResolver()
+        video = douyin_mod.DouyinVideo(
+            aweme_id="123",
+            ok=True,
+            title="图文",
+            images=["https://i1.jpg", "https://i2.jpg"],
+        )
+        with mock.patch.object(douyin_mod, "video_for", lambda *a, **k: video):
+            info = resolver._resolve_sync("https://www.douyin.com/video/1234567890")
+        self.assertTrue(info.ok)
+        self.assertEqual(info.meta, "类型：图文（2 张）")
+
+    def test_resolve_reports_bridge_failure(self):
+        resolver = links_mod.LinkResolver()
+        video = douyin_mod.DouyinVideo(
+            aweme_id="123", ok=False, error="未找到 Chrome/Edge，无法解析抖音链接"
+        )
+        with mock.patch.object(douyin_mod, "video_for", lambda *a, **k: video):
+            info = resolver._resolve_sync("https://www.douyin.com/video/1234567890")
+        self.assertFalse(info.ok)
+        self.assertIn("Chrome", info.error)
+
+    def test_resolve_without_aweme_id_skips_bridge(self):
+        resolver = links_mod.LinkResolver()
+        with mock.patch.object(
+            douyin_mod, "video_for", side_effect=AssertionError("不该调用浏览器")
+        ):
+            info = resolver._resolve_sync("https://www.douyin.com/")
+        self.assertFalse(info.ok)
+        self.assertIn("作品 ID", info.error)
+
+    def test_download_uses_play_addr(self):
+        resolver = links_mod.LinkResolver()
+        video = douyin_mod.DouyinVideo(
+            aweme_id="123", ok=True, title="标题", video_url="https://v/1.mp4"
+        )
+        seen = {}
+
+        def fake_download(url, outdir, **kwargs):
+            seen["url"] = url
+            seen["filename"] = kwargs.get("filename")
+            seen["max_bytes"] = kwargs.get("max_bytes")
+            return os.path.join(outdir, "标题.mp4")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(douyin_mod, "video_for", lambda *a, **k: video), \
+                 mock.patch.object(douyin_mod, "download_video", fake_download):
+                path = resolver._download_sync(
+                    "https://www.douyin.com/video/1234567890", tmp, 5
+                )
+        self.assertEqual(seen["url"], "https://v/1.mp4")
+        self.assertEqual(seen["filename"], "标题")
+        self.assertEqual(seen["max_bytes"], 5 * 1024 * 1024)
+        self.assertTrue(path.endswith("标题.mp4"))
+
+    def test_download_skips_image_posts(self):
+        resolver = links_mod.LinkResolver()
+        video = douyin_mod.DouyinVideo(
+            aweme_id="123", ok=True, title="图文", images=["https://i1.jpg"]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(douyin_mod, "video_for", lambda *a, **k: video), \
+                 mock.patch.object(
+                     douyin_mod, "download_video", side_effect=AssertionError("不该下载")
+                 ):
+                path = resolver._download_sync(
+                    "https://www.douyin.com/video/1234567890", tmp, 0
+                )
+        self.assertIsNone(path)
 
 
 class TweetTests(unittest.TestCase):
