@@ -703,6 +703,32 @@ _DETAIL_CACHE: "OrderedDict[str, tuple[float, DouyinVideo]]" = OrderedDict()
 _CACHE_LOCK = threading.Lock()
 # 浏览器实例较重（内存 + 启动开销），同时只跑一个，避免多链接并发时起一堆。
 _BROWSER_LOCK = threading.Lock()
+#: 等解析锁的上限。会话一旦卡在 CDP 上不返回，没有超时的 ``with`` 会让之后
+#: **每一次**抖音解析无限期排队——表现为「链接发了、提示也回了，然后永远没有
+#: 下文」，而且一句日志都没有。宁可这次放弃，也不能把整条路堵死。
+_BROWSER_LOCK_TIMEOUT = 60.0
+
+
+class _Flight:
+    """同一条作品正在进行的解析，供并发调用方共享结果。"""
+
+    __slots__ = ("event", "video")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.video: DouyinVideo | None = None
+
+
+#: 在途解析合并：``aweme_id`` → 正在跑的那次解析。
+#:
+#: 同一条链接会被**两处**并发解析：``engine._handle_links`` 的「下载并回发」
+#: 路径和 ``engine._prefetch_links`` 的「喂给模型当上下文」路径。两者都落到
+#: :func:`video_for`，而详情缓存**只缓存成功结果**，于是第一次必然双开浏览器，
+#: 后到的那个堵在 :data:`_BROWSER_LOCK` 上直到超时——失败结果还会被 LinkResolver
+#: 缓存 10 分钟，连带把「解析失败」误报给用户。这里让同一作品同一时刻只跑一次，
+#: 其余调用方直接等它的结果（失败也共享，不再重复开浏览器）。
+_INFLIGHT: dict[str, _Flight] = {}
+_INFLIGHT_GUARD = threading.Lock()
 
 
 def _cache_lookup(aweme_id: str) -> DouyinVideo | None:
@@ -772,53 +798,61 @@ def fetch_video_via_browser(
     query = urllib.parse.urlencode(_web_params(aweme_id))
     path = f"{urllib.parse.urlsplit(_DETAIL_API).path}?{query}"
     reason = ""
+    if not _BROWSER_LOCK.acquire(timeout=_BROWSER_LOCK_TIMEOUT):
+        message = (
+            f"上一次浏览器解析超过 {_BROWSER_LOCK_TIMEOUT:.0f} 秒仍未结束，"
+            "本次跳过（重启程序可恢复）"
+        )
+        log("warning", f"抖音解析跳过：{message}")
+        return DouyinVideo(aweme_id=aweme_id, error=message)
     try:
-        with _BROWSER_LOCK:
-            page = browser.BrowserSession(logger=log, timeout=timeout)
-            try:
-                page.start()
-                page.navigate(f"https://www.douyin.com/video/{aweme_id}")
-                # 等页面真正落到抖音域：导航会替换执行上下文，过早发请求会落在
-                # about:blank 上（同源策略下相对路径必然失败）。
-                # 刻意**不**等 readyState=complete——视频页要加载视频资源，很慢。
-                page.wait_for(
-                    "location.host.indexOf('douyin.com') >= 0",
-                    timeout=min(timeout, 15.0),
-                )
-                for _ in range(max(1, attempts)):
-                    try:
-                        status, body = page.xhr_get(
-                            path, timeout_ms=int(min(timeout, 15.0) * 1000)
-                        )
-                    except Exception as exc:
-                        # 页面仍在跳转（抖音是 SPA，会做客户端路由），下一轮再试。
-                        reason = f"页面尚未就绪：{exc}"
-                        time.sleep(interval)
-                        continue
-                    if status == 200:
-                        try:
-                            payload = json.loads(body)
-                        except json.JSONDecodeError:
-                            reason = "接口返回的不是 JSON"
-                            break
-                        detail = payload.get("aweme_detail")
-                        if detail:
-                            return parse_detail(detail)
-                        reason = (
-                            "接口未返回作品数据"
-                            f"（status_code={payload.get('status_code')}）"
-                        )
-                        break
-                    # 前几次必然 403（Uifid 还没种下），继续等；网络层失败
-                    # （status <= 0）也可能是页面刚就绪，同样再试几轮。
-                    reason = (body or "").strip()[:120] or f"HTTP {status}"
+        page = browser.BrowserSession(logger=log, timeout=timeout)
+        try:
+            page.start()
+            page.navigate(f"https://www.douyin.com/video/{aweme_id}")
+            # 等页面真正落到抖音域：导航会替换执行上下文，过早发请求会落在
+            # about:blank 上（同源策略下相对路径必然失败）。
+            # 刻意**不**等 readyState=complete——视频页要加载视频资源，很慢。
+            page.wait_for(
+                "location.host.indexOf('douyin.com') >= 0",
+                timeout=min(timeout, 15.0),
+            )
+            for _ in range(max(1, attempts)):
+                try:
+                    status, body = page.xhr_get(
+                        path, timeout_ms=int(min(timeout, 15.0) * 1000)
+                    )
+                except Exception as exc:
+                    # 页面仍在跳转（抖音是 SPA，会做客户端路由），下一轮再试。
+                    reason = f"页面尚未就绪：{exc}"
                     time.sleep(interval)
-            finally:
-                # 清理很慢（杀进程树 + 删几百 MB 的临时 profile），丢到后台
-                # 线程，别挡住解析结果的返回。
-                page.close(blocking=False)
+                    continue
+                if status == 200:
+                    try:
+                        payload = json.loads(body)
+                    except json.JSONDecodeError:
+                        reason = "接口返回的不是 JSON"
+                        break
+                    detail = payload.get("aweme_detail")
+                    if detail:
+                        return parse_detail(detail)
+                    reason = (
+                        "接口未返回作品数据"
+                        f"（status_code={payload.get('status_code')}）"
+                    )
+                    break
+                # 前几次必然 403（Uifid 还没种下），继续等；网络层失败
+                # （status <= 0）也可能是页面刚就绪，同样再试几轮。
+                reason = (body or "").strip()[:120] or f"HTTP {status}"
+                time.sleep(interval)
+        finally:
+            # 清理很慢（杀进程树 + 删几百 MB 的临时 profile），丢到后台
+            # 线程，别挡住解析结果的返回。
+            page.close(blocking=False)
     except Exception as exc:
         return DouyinVideo(aweme_id=aweme_id, error=f"浏览器解析失败：{exc}")
+    finally:
+        _BROWSER_LOCK.release()
     return DouyinVideo(aweme_id=aweme_id, error=reason or "抖音解析失败")
 
 
@@ -829,15 +863,45 @@ def video_for(
     timeout: float = 30.0,
     force: bool = False,
 ) -> DouyinVideo:
-    """带缓存的 :func:`fetch_video_via_browser`（仅缓存成功结果）。"""
+    """带缓存的 :func:`fetch_video_via_browser`（仅缓存成功结果）。
+
+    并发调用同一条作品时**合并成一次**浏览器解析：先到的负责跑，后到的等它
+    出结果（成功走缓存，失败也共享同一个错误），避免重复开浏览器互相排队。
+    """
     if not force:
         hit = _cache_lookup(aweme_id)
         if hit is not None:
             return hit
-    video = fetch_video_via_browser(aweme_id, logger=logger, timeout=timeout)
-    if video.ok:
-        _cache_store(aweme_id, video)
-    return video
+
+    with _INFLIGHT_GUARD:
+        flight = _INFLIGHT.get(aweme_id)
+        owner = flight is None
+        if owner:
+            flight = _Flight()
+            _INFLIGHT[aweme_id] = flight
+
+    if not owner:
+        # 等正在跑的那一次；等到就直接复用它的结果（失败也不重跑）。
+        wait = max(float(timeout), _BROWSER_LOCK_TIMEOUT) + 5.0
+        if flight is not None and flight.event.wait(wait) and flight.video is not None:
+            return flight.video
+        # 等不到（对方超时/崩了）就自己跑一次，但仍不注册新的在途记录。
+        video = fetch_video_via_browser(aweme_id, logger=logger, timeout=timeout)
+        if video.ok:
+            _cache_store(aweme_id, video)
+        return video
+
+    try:
+        video = fetch_video_via_browser(aweme_id, logger=logger, timeout=timeout)
+        if video.ok:
+            _cache_store(aweme_id, video)
+        flight.video = video
+        return video
+    finally:
+        with _INFLIGHT_GUARD:
+            if _INFLIGHT.get(aweme_id) is flight:
+                _INFLIGHT.pop(aweme_id, None)
+        flight.event.set()
 
 
 def download_video(

@@ -603,6 +603,13 @@ class WeChatBridge:
     SEND_BACKOFF_BASE_SECONDS = 0.3      # 发送异常后的短冷却（更快恢复）
     SEND_BACKOFF_MAX_SECONDS = 2.0       # 冷却最长 2 秒（减少等待）
     SEND_ITEM_TTL_SECONDS = 60.0         # 排队太久没发出去的回复直接丢弃
+    # 附件发送后回查数据库确认的等待上限。微信落库是异步的，大附件更慢，
+    # 但也不能无限等——超时就判定为「微信没收下」，让上层能看见失败。
+    FILE_CONFIRM_TIMEOUT_SECONDS = 10.0
+    #: 视为「附件已落地」的消息类型（对应 wechatauto 的 MSG_TYPE_NAMES）。
+    #: 图片=3、视频=43、文件/链接/卡片=49。视频消息正文里没有文件名，
+    #: 只能像图片一样靠「类型 + 时序」判断。
+    ATTACHMENT_MSG_TYPES = ("图片", "视频", "文件/链接/卡片")
     MESSAGE_DEDUPE_WINDOW_SECONDS = 60.0 # 去重窗口60秒（避免重复但不过长）
     # 机器人昵称缓存的有效期：微信里改了昵称后不必重启程序——一旦遇到「有 @ 但
     # 没匹配上」的消息，就按这个间隔重读一次昵称（避免每条群消息都去查库）。
@@ -2343,7 +2350,13 @@ class WeChatBridge:
         file_path: str | os.PathLike,
         timeout: float = 45.0,
     ) -> bool:
-        """发送本地文件（语音 / 歌曲等），复用发送串行锁避免与文本抢窗口。"""
+        """发送本地文件（语音 / 歌曲等），复用发送串行锁避免与文本抢窗口。
+
+        与 ``send_image`` 一样用 ``asyncio.shield`` 托住底层同步发送：超时后
+        那个线程并不会被取消（``asyncio.to_thread`` 不可取消），此时若立刻放开
+        发送闸门，后面的文本/附件会和它还留在输入框里的粘贴动作抢同一个窗口。
+        所以超时后把收尾交给后台观察者，闸门等底层真正结束再放。
+        """
         path = os.path.abspath(os.fspath(file_path))
         if not os.path.isfile(path):
             logger.error(f"文件不存在，无法发送: {path}")
@@ -2352,8 +2365,21 @@ class WeChatBridge:
             logger.error("微信未连接，无法发送文件")
             return False
 
+        try:
+            size_mb = os.path.getsize(path) / 1024 / 1024
+        except OSError:
+            size_mb = 0.0
+        # 大附件在微信侧要落盘/转码，固定 45 秒会误判为超时；
+        # 按体积放宽，但设上限避免长期占着发送闸门。
+        effective_timeout = min(max(float(timeout), 30.0 + size_mb), 180.0)
+        logger.info(
+            f"开始发送文件: [{room_name}] {os.path.basename(path)} "
+            f"({size_mb:.1f} MB，超时 {effective_timeout:.0f}s)"
+        )
+
         send_gate = self._get_send_gate()
         gate_held = False
+        send_task: asyncio.Task | None = None
         try:
             await send_gate.acquire()
             gate_held = True
@@ -2364,12 +2390,24 @@ class WeChatBridge:
             )
             if wait > 0:
                 await asyncio.sleep(wait)
+            send_task = asyncio.create_task(
+                asyncio.to_thread(self._send_file_sync, room_name, path)
+            )
             success = await asyncio.wait_for(
-                asyncio.to_thread(self._send_file_sync, room_name, path),
-                timeout=max(5.0, float(timeout)),
+                asyncio.shield(send_task),
+                timeout=max(5.0, effective_timeout),
             )
         except asyncio.TimeoutError:
-            logger.warning(f"发送文件超时: [{room_name}] {path}")
+            if send_task is not None:
+                asyncio.create_task(
+                    self._observe_file_send(send_task, room_name, path, send_gate)
+                )
+                # 观察者接管闸门，直到底层同步发送真正结束。
+                gate_held = False
+            logger.warning(
+                f"发送文件超时（{effective_timeout:.0f}s），后台继续等待结果: "
+                f"[{room_name}] {path}"
+            )
             return False
         except Exception as exc:
             logger.error(f"发送文件失败: [{room_name}] {exc}")
@@ -2379,30 +2417,171 @@ class WeChatBridge:
                 send_gate.release()
 
         if not success:
-            logger.error(f"发送文件失败: [{room_name}] {path}")
+            logger.error(f"发送文件未成功: [{room_name}] {path}")
             return False
         self._last_send_at = time.monotonic()
         logger.info(f"文件已发送到 [{room_name}]: {path}")
         return True
 
+    async def _observe_file_send(
+        self,
+        task: asyncio.Task,
+        room_name: str,
+        file_path: str,
+        send_gate: asyncio.Lock | None = None,
+    ) -> None:
+        """收尾超时的文件发送：等底层同步发送真正结束，再放开发送闸门。"""
+        success = False
+        try:
+            success = bool(await task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                f"后台文件发送确认失败: [{room_name}] {file_path}: {exc}"
+            )
+            return
+        finally:
+            if send_gate is not None and send_gate.locked():
+                send_gate.release()
+            if success:
+                self._last_send_at = time.monotonic()
+                logger.info(
+                    f"文件已在后台确认发送成功: [{room_name}] {file_path}"
+                )
+            else:
+                logger.error(f"文件后台确认发送失败: [{room_name}] {file_path}")
+
     def _send_file_sync(self, room_name: str, file_path: str) -> bool:
-        """同步发送文件，统一走 wxauto 的 SendFiles。"""
+        """同步发送文件：走 wxauto 的 SendFiles，并在发送后回查数据库确认。
+
+        为什么必须回查：剪贴板粘贴路线（``guia._paste_attachment_and_send``）
+        对**非图片**附件是无条件返回成功的——它不检测草稿是否出现，按完回车就
+        ``return True``。微信若因体积超限、输入框未就绪等原因没有真的把附件放
+        上去，这里既不会抛异常也不会返回失败，只表现为「聊天里什么都没多出来」。
+        0.8.7 实测就踩到了：群里 101.6 MB 的视频被静默吞掉，日志却记成功。
+        """
         try:
             if self._backend == "wechatauto":
                 from wechatauto.utils.lock import LockManager
 
                 with LockManager.acquire():
+                    self._reset_layout_recalibration()
+                    before_seq = self._target_seq(room_name)
                     result = self._wx.SendFiles(
                         file_path,
                         who=room_name,
                         exact=True,
                     )
-                    return result is None or bool(result)
+                    if not (result is None or bool(result)):
+                        logger.error(
+                            f"发送文件被拒绝: [{room_name}] {file_path}: {result}"
+                        )
+                        return False
+                    if self._confirm_file_sent(room_name, before_seq):
+                        return True
+                    logger.error(
+                        "发送文件未在数据库中得到确认，微信很可能没有真正收下"
+                        f"这个附件（体积超限 / 输入框未就绪）: [{room_name}] "
+                        f"{os.path.basename(file_path)}"
+                    )
+                    return False
             result = self._wx.SendFiles(file_path, who=room_name)
             return result is None or bool(result)
         except Exception as exc:
             logger.error(f"发送文件异常: {exc}")
             return False
+
+    def _reset_layout_recalibration(self) -> None:
+        """让 wechatauto 在输入框探测再次失败时重新校准布局。
+
+        ``guia.get_input_box()`` 探测连续失败时会自动 ``calibrate_layout()``，
+        但该动作被 ``_auto_recalibrated`` 限制成「**每会话只触发一次**」。实测
+        0.8.7：08:23 第一次失败靠它救回来了（校准后粘贴成功），08:27 第二次失败
+        时标志已置位，于是直接回退到按 ``render_h`` 比例算出来的**猜测坐标**，
+        粘贴就可能落空——而那条路不报错，只表现为「聊天里什么都没多出来」。
+
+        发送附件前把这个标志复位，等于每次附件发送都重新保留
+        「探测失败 → 重新校准」这条兜底路径。探测正常时不会触发校准，
+        所以不增加额外开销。第三方内部属性，取不到就安静跳过。
+        """
+        gui = getattr(self._wx, "_gui", None)
+        if gui is None or not getattr(gui, "_auto_recalibrated", False):
+            return
+        try:
+            gui._auto_recalibrated = False
+        except Exception as exc:  # pragma: no cover - 属性只读时忽略
+            logger.debug(f"复位布局重校准标志失败: {exc}")
+
+    def _resolve_db_user(self, room_name: str) -> str:
+        """显示名 → 数据库里的会话 username；查不到就按原名试。"""
+        db = getattr(self._wx, "_db", None)
+        if db is None:
+            return room_name
+        try:
+            hits = db.search_contact(room_name)
+        except Exception as exc:
+            logger.debug(f"按显示名反查会话失败: [{room_name}] {exc}")
+            return room_name
+        if hits:
+            return hits[0].get("username") or room_name
+        return room_name
+
+    def _target_seq(self, room_name: str) -> int:
+        """取目标会话当前最大 sort_seq，作为发送后确认的基线。
+
+        取不到时返回 ``-1``（区别于「会话为空」的 0），调用方据此跳过确认，
+        避免在拿不到水位时把历史附件误判成本次发送的结果。
+        """
+        db = getattr(self._wx, "_db", None)
+        if db is None:
+            return -1
+        try:
+            rows = db.get_messages(self._resolve_db_user(room_name), limit=1)
+        except Exception as exc:
+            logger.debug(f"读取会话水位失败: [{room_name}] {exc}")
+            return -1
+        return rows[0].get("sort_seq", 0) if rows else 0
+
+    def _confirm_file_sent(
+        self,
+        room_name: str,
+        before_seq: int,
+        timeout: float | None = None,
+    ) -> bool:
+        """轮询数据库，确认这次发送真的产生了一条附件消息。
+
+        视频消息的正文里**没有文件名**（只有 ``<videomsg>`` 的 aeskey/md5），
+        无法像文件那样按名字匹配，所以只能像图片一样靠「新出现的、自己发出的
+        附件类消息」判断。发送闸门保证了同一时刻只有一条附件在发，不会误判。
+
+        返回 False 表示「明确没发出去」；数据库不可用或水位拿不到时返回 True
+        （无法确认 ≠ 发送失败，不能因此阻断发送）。
+        """
+        db = getattr(self._wx, "_db", None)
+        if db is None or before_seq < 0:
+            return True
+        user = self._resolve_db_user(room_name)
+        if timeout is None:
+            timeout = self.FILE_CONFIRM_TIMEOUT_SECONDS
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            try:
+                rows = db.get_new_messages(user, since_seq=before_seq, limit=8)
+            except Exception as exc:
+                logger.debug(f"确认附件落库失败: [{room_name}] {exc}")
+                return True
+            for row in rows:
+                if row.get("sender_id") != 2:
+                    continue
+                if row.get("type") in self.ATTACHMENT_MSG_TYPES:
+                    logger.debug(
+                        f"已确认附件落库: [{room_name}] {row.get('type')}"
+                    )
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
 
     async def send_random_favorite_sticker(
         self,

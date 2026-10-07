@@ -817,7 +817,11 @@ class DeepSeekGirlAdapter:
             file_size=file_size,
             error=None
             if sent
-            else {"code": "send_failed", "message": "底层发送未成功，结果未确认"},
+            else {
+                "code": "send_failed",
+                "message": "底层发送未成功：未能确认微信已收下该附件"
+                "（常见原因：体积超限、输入框未就绪），详情见运行日志",
+            },
         )
 
     # ------------------------------------------------------------------ 关注列表

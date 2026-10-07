@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -1758,6 +1759,156 @@ class ShortLinkTests(unittest.TestCase):
         self.assertEqual(seen["url"], "https://www.bilibili.com/video/BV1xx411c7mD")
 
 
+class BridgeFileSendConfirmTests(unittest.TestCase):
+    """附件发送后的「数据库回查确认」。
+
+    回归点：``guia._paste_attachment_and_send`` 对**非图片**附件无条件返回成功
+    （不检测草稿、按完回车就 return True），微信若因体积超限等原因没把附件放上去，
+    桥接层既收不到异常也收不到失败，只表现为「聊天里什么都没多出来」。
+    0.8.7 实测：群里 101.6 MB 的视频被静默吞掉，日志却记成功。
+    所以发送后必须回查数据库，把静默失败变成明确失败。
+    """
+
+    @staticmethod
+    def _module():
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[1]
+        module_file = root / "packaging" / "wechat_bridge.py"
+        spec = importlib.util.spec_from_file_location(
+            "packaged_wechat_bridge_filesend", module_file
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _bridge(module, wx):
+        bridge = object.__new__(module.WeChatBridge)
+        bridge._backend = "wechatauto"
+        bridge._wx = wx
+        bridge.FILE_CONFIRM_TIMEOUT_SECONDS = 0.6
+        return bridge
+
+    def test_confirms_when_attachment_lands(self):
+        """发送后库里出现「自己发的视频消息」→ 确认成功。"""
+        module = self._module()
+        fake = _FakeWxDb(
+            seq=100,
+            new=[{"sender_id": 2, "type": "视频", "sort_seq": 101}],
+        )
+        bridge = self._bridge(module, SimpleNamespace(_db=fake))
+        self.assertTrue(bridge._confirm_file_sent("群聊", 100))
+
+    def test_fails_when_nothing_lands(self):
+        """库里什么都没多出来 → 判定失败（而不是报成功）。"""
+        module = self._module()
+        fake = _FakeWxDb(seq=100, new=[])
+        bridge = self._bridge(module, SimpleNamespace(_db=fake))
+        self.assertFalse(bridge._confirm_file_sent("群聊", 100))
+
+    def test_ignores_peer_messages_and_text(self):
+        """别人发的、或纯文本消息都不算附件落地。"""
+        module = self._module()
+        fake = _FakeWxDb(
+            seq=100,
+            new=[
+                {"sender_id": 1, "type": "视频", "sort_seq": 101},
+                {"sender_id": 2, "type": "文本", "sort_seq": 102},
+            ],
+        )
+        bridge = self._bridge(module, SimpleNamespace(_db=fake))
+        self.assertFalse(bridge._confirm_file_sent("群聊", 100))
+
+    def test_accepts_all_attachment_types(self):
+        """图片 / 视频 / 文件三种类型都算落地（视频正文里没有文件名，只能靠类型）。"""
+        module = self._module()
+        for kind in ("图片", "视频", "文件/链接/卡片"):
+            fake = _FakeWxDb(
+                seq=1, new=[{"sender_id": 2, "type": kind, "sort_seq": 2}]
+            )
+            bridge = self._bridge(module, SimpleNamespace(_db=fake))
+            with self.subTest(kind=kind):
+                self.assertTrue(bridge._confirm_file_sent("群聊", 1))
+
+    def test_unverifiable_baseline_is_not_a_failure(self):
+        """拿不到水位（-1）或没有数据库时不阻断发送。"""
+        module = self._module()
+        bridge = self._bridge(module, SimpleNamespace(_db=None))
+        self.assertTrue(bridge._confirm_file_sent("群聊", 100))
+        bridge = self._bridge(
+            module, SimpleNamespace(_db=_FakeWxDb(seq=0, new=[]))
+        )
+        self.assertTrue(bridge._confirm_file_sent("群聊", -1))
+
+    def test_target_seq_returns_minus_one_without_db(self):
+        module = self._module()
+        bridge = self._bridge(module, SimpleNamespace(_db=None))
+        self.assertEqual(bridge._target_seq("群聊"), -1)
+
+    def test_target_seq_resolves_display_name(self):
+        """按显示名发送，回查要用反查到的 username。"""
+        module = self._module()
+        fake = _FakeWxDb(seq=7, new=[], username="43081897466@chatroom")
+        bridge = self._bridge(module, SimpleNamespace(_db=fake))
+        self.assertEqual(bridge._target_seq("玩什么游戏"), 7)
+        self.assertEqual(fake.asked_for, "43081897466@chatroom")
+
+    def test_send_file_sync_fails_when_not_confirmed(self):
+        """SendFiles 说成功、但库里没有 → 整体返回 False。"""
+        module = self._module()
+        fake = _FakeWxDb(seq=100, new=[])
+        wx = SimpleNamespace(_db=fake, SendFiles=lambda *a, **k: None)
+        bridge = self._bridge(module, wx)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "clip.mp4"
+            target.write_bytes(b"x")
+            self.assertFalse(bridge._send_file_sync("群聊", str(target)))
+
+    def test_send_file_sync_rejects_explicit_failure(self):
+        """SendFiles 明确返回失败 → 不再回查，直接失败。"""
+        module = self._module()
+        fake = _FakeWxDb(seq=100, new=[])
+        wx = SimpleNamespace(_db=fake, SendFiles=lambda *a, **k: 0)
+        bridge = self._bridge(module, wx)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "clip.mp4"
+            target.write_bytes(b"x")
+            self.assertFalse(bridge._send_file_sync("群聊", str(target)))
+
+    def test_reset_layout_recalibration(self):
+        """把 wechatauto「每会话只校准一次」的标志复位，让探测失败能再校准。"""
+        module = self._module()
+        gui = SimpleNamespace(_auto_recalibrated=True)
+        bridge = self._bridge(module, SimpleNamespace(_gui=gui))
+        bridge._reset_layout_recalibration()
+        self.assertFalse(gui._auto_recalibrated)
+        # 没有 _gui 或标志不存在时安静跳过
+        bridge = self._bridge(module, SimpleNamespace())
+        bridge._reset_layout_recalibration()
+
+
+class _FakeWxDb:
+    """只实现回查确认用到的那几个 WeChatDB 方法。"""
+
+    def __init__(self, seq=0, new=None, username="wxid_target"):
+        self.seq = seq
+        self.new = list(new or [])
+        self.username = username
+        self.asked_for = None
+
+    def search_contact(self, keyword):
+        return [{"username": self.username, "nick_name": keyword}]
+
+    def get_messages(self, user, limit=1, offset=0):
+        self.asked_for = user
+        return [{"sort_seq": self.seq, "local_id": 1}]
+
+    def get_new_messages(self, user, since_seq=0, limit=200):
+        self.asked_for = user
+        return [row for row in self.new if row.get("sort_seq", 0) > since_seq]
+
+
 class BrowserBridgeTests(unittest.TestCase):
     """浏览器桥里不依赖真实浏览器的部分。"""
 
@@ -1805,6 +1956,75 @@ class BrowserBridgeTests(unittest.TestCase):
                     path.rmdir()
                 except OSError:
                     pass
+
+
+    def test_sweep_cleans_own_stale_profile(self):
+        """自己进程留下的旧目录也要清掉。
+
+        回归点：原来只看目录名里的 PID 是否存活，而**自己**的 PID 永远活着，
+        于是每次解析漏下的临时目录和无头浏览器越堆越多（实测 78 分钟堆了 4 个）。
+        对自家目录必须改用 mtime 判断。
+        """
+        mine_old = Path(tempfile.gettempdir()) / (
+            f"{browser_mod._PROFILE_PREFIX}{os.getpid()}-unittest-mine-old"
+        )
+        mine_new = Path(tempfile.gettempdir()) / (
+            f"{browser_mod._PROFILE_PREFIX}{os.getpid()}-unittest-mine-new"
+        )
+        for path in (mine_old, mine_new):
+            path.mkdir(exist_ok=True)
+        stamp = time.time() - (browser_mod._OWN_PROFILE_STALE_SECONDS + 60)
+        os.utime(mine_old, (stamp, stamp))
+        try:
+            browser_mod._sweep_stale_profiles()
+            self.assertFalse(mine_old.exists(), "自己的过期目录应被清掉")
+            self.assertTrue(mine_new.exists(), "自己刚建的目录不能误删")
+        finally:
+            for path in (mine_old, mine_new):
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+
+    def test_pick_page_target_prefers_about_blank(self):
+        """必须挑命令行指定的 about:blank，而不是 Edge 自己开的内部页。
+
+        回归点：全新用户目录启动时 Edge 会额外开一个
+        ``edge://sync-confirmation-dialog/``，它在 ``/json/list`` 里排在前面。
+        原来取第一个 ``page`` 会连上它，导航落错地方，``about:blank`` 一直空白
+        ——现象是「浏览器起来了但没进抖音」，解析白等一场。
+        """
+        targets = [
+            {"type": "page", "url": "edge://sync-confirmation-dialog/", "webSocketDebuggerUrl": "ws://a"},
+            {"type": "page", "url": "about:blank", "webSocketDebuggerUrl": "ws://b"},
+        ]
+        self.assertEqual(browser_mod._pick_page_target(targets)["url"], "about:blank")
+
+    def test_pick_page_target_skips_internal_pages(self):
+        """没有 about:blank 时，也要跳过内部页，挑真正的网页。"""
+        targets = [
+            {"type": "page", "url": "edge://sync-confirmation-dialog/", "webSocketDebuggerUrl": "ws://a"},
+            {"type": "page", "url": "https://www.douyin.com/", "webSocketDebuggerUrl": "ws://c"},
+        ]
+        self.assertEqual(
+            browser_mod._pick_page_target(targets)["url"], "https://www.douyin.com/"
+        )
+
+    def test_pick_page_target_ignores_non_pages(self):
+        """只有 iframe/worker 时返回 None（让调用方继续轮询）。"""
+        targets = [{"type": "iframe", "url": "about:blank", "webSocketDebuggerUrl": "ws://a"}]
+        self.assertIsNone(browser_mod._pick_page_target(targets))
+        self.assertIsNone(browser_mod._pick_page_target([]))
+
+
+class _RaisingBrowserSession:
+    """``start()`` 就抛异常的假会话，用于验证异常路径会释放解析锁。"""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def start(self):
+        raise RuntimeError("模拟浏览器启动失败")
 
 
 class DouyinTests(unittest.TestCase):
@@ -1901,6 +2121,138 @@ class DouyinTests(unittest.TestCase):
         video = douyin_mod.fetch_video_via_browser("")
         self.assertFalse(video.ok)
         self.assertIn("作品 ID", video.error)
+
+    def test_browser_lock_timeout_returns_error(self):
+        """拿不到解析锁时快速报错，而不是无限期排队。
+
+        回归点：原来用裸 ``with _BROWSER_LOCK``，一旦某个会话卡在 CDP 上不返回，
+        之后**每一次**抖音解析都会永久排队——现象正是「链接发了、提示也回了、
+        然后永远没有下文」，而且一句日志都没有。实测 09:35 就这样堵死了。
+        """
+        held = douyin_mod._BROWSER_LOCK.acquire(blocking=False)
+        self.assertTrue(held, "测试前置：应能拿到锁")
+        try:
+            with mock.patch.object(douyin_mod, "_BROWSER_LOCK_TIMEOUT", 0.2), \
+                    mock.patch.object(
+                        browser_mod, "browser_available", lambda: True
+                    ):
+                video = douyin_mod.fetch_video_via_browser("1234567890")
+        finally:
+            douyin_mod._BROWSER_LOCK.release()
+        self.assertFalse(video.ok)
+        self.assertIn("仍未结束", video.error or "")
+
+    def test_browser_lock_released_on_failure(self):
+        """解析失败也必须把锁放掉，否则后续链接全被堵死。"""
+        with mock.patch.object(browser_mod, "browser_available", lambda: True), \
+                mock.patch.object(
+                    browser_mod, "BrowserSession", _RaisingBrowserSession
+                ):
+            video = douyin_mod.fetch_video_via_browser("1234567890")
+        self.assertFalse(video.ok)
+        self.assertTrue(
+            douyin_mod._BROWSER_LOCK.acquire(blocking=False),
+            "异常路径必须释放解析锁",
+        )
+        douyin_mod._BROWSER_LOCK.release()
+
+    def test_video_for_coalesces_concurrent_calls(self):
+        """同一作品被并发解析时只开一次浏览器，其余调用方共享结果。
+
+        回归点：``engine._handle_links``（下载回发）和 ``engine._prefetch_links``
+        （喂模型当上下文）会**同时**解析同一条链接，详情缓存只存成功结果，
+        于是第一次必然双开浏览器、后到的那个堵在解析锁上直到超时。
+        """
+        started = threading.Event()
+        calls = {"n": 0}
+        video = douyin_mod.DouyinVideo(
+            aweme_id="1234567890",
+            ok=True,
+            title="标题",
+            video_url="https://v/1.mp4",
+        )
+
+        def fake_fetch(aweme_id, *, logger=None, timeout=30.0):
+            calls["n"] += 1
+            started.set()
+            time.sleep(0.3)
+            return video
+
+        results: list[object] = []
+        with mock.patch.object(douyin_mod, "fetch_video_via_browser", fake_fetch):
+            first = threading.Thread(
+                target=lambda: results.append(
+                    douyin_mod.video_for("1234567890")
+                )
+            )
+            first.start()
+            self.assertTrue(started.wait(2.0), "第一个线程应已进入解析")
+            # 第二个线程在解析进行中进来，应被合并掉。
+            second = threading.Thread(
+                target=lambda: results.append(
+                    douyin_mod.video_for("1234567890")
+                )
+            )
+            second.start()
+            first.join(5.0)
+            second.join(5.0)
+
+        self.assertEqual(calls["n"], 1, "同一条作品只应真正解析一次")
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(item.ok for item in results))
+        self.assertIs(results[0], results[1], "并发调用方应共享同一个结果对象")
+        # 结束后在途记录要清干净，否则后续重试会一直被合并。
+        self.assertEqual(douyin_mod._INFLIGHT, {})
+
+    def test_video_for_shares_failure_without_rerun(self):
+        """解析失败也共享，不让第二个调用方再开一次浏览器。"""
+        started = threading.Event()
+        calls = {"n": 0}
+        failed = douyin_mod.DouyinVideo(aweme_id="1234567890", error="签名失败")
+
+        def fake_fetch(aweme_id, *, logger=None, timeout=30.0):
+            calls["n"] += 1
+            started.set()
+            time.sleep(0.3)
+            return failed
+
+        results: list[object] = []
+        with mock.patch.object(douyin_mod, "fetch_video_via_browser", fake_fetch):
+            first = threading.Thread(
+                target=lambda: results.append(douyin_mod.video_for("1234567890"))
+            )
+            first.start()
+            self.assertTrue(started.wait(2.0))
+            second = threading.Thread(
+                target=lambda: results.append(douyin_mod.video_for("1234567890"))
+            )
+            second.start()
+            first.join(5.0)
+            second.join(5.0)
+
+        self.assertEqual(calls["n"], 1, "失败也不应触发第二次解析")
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(not item.ok for item in results))
+        self.assertEqual(results[1].error, "签名失败")
+        self.assertEqual(douyin_mod._INFLIGHT, {})
+
+    def test_video_for_force_bypasses_inflight(self):
+        """``force=True`` 不参与合并：下载失败重取直链时必须真的重跑。"""
+        calls = {"n": 0}
+        good = douyin_mod.DouyinVideo(
+            aweme_id="1234567890", ok=True, video_url="https://v/1.mp4"
+        )
+
+        def fake_fetch(aweme_id, *, logger=None, timeout=30.0):
+            calls["n"] += 1
+            return good
+
+        with mock.patch.object(douyin_mod, "fetch_video_via_browser", fake_fetch):
+            douyin_mod.video_for("1234567890")
+            douyin_mod.video_for("1234567890")          # 命中缓存
+            self.assertEqual(calls["n"], 1)
+            douyin_mod.video_for("1234567890", force=True)
+        self.assertEqual(calls["n"], 2)
 
     def test_fetch_via_browser_returns_detail(self):
         """整条浏览器流程打桩：只验证「导航→轮询→解析」的编排。"""

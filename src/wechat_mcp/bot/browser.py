@@ -276,11 +276,11 @@ class BrowserSession:
                 raise RuntimeError("浏览器进程已退出")
             try:
                 targets = json.loads(self._debugger_url("list"))
-                for target in targets:
-                    if target.get("type") == "page":
-                        return _WebSocket(
-                            target["webSocketDebuggerUrl"], timeout=self._timeout
-                        )
+                chosen = _pick_page_target(targets)
+                if chosen is not None:
+                    return _WebSocket(
+                        chosen["webSocketDebuggerUrl"], timeout=self._timeout
+                    )
             except Exception as exc:  # 端口还没起来
                 last_error = str(exc)
             time.sleep(0.3)
@@ -476,7 +476,45 @@ _PROFILE_PREFIX = "wechat-mcp-browser-"
 # 删掉临时目录，只有进程被强杀 / 短命脚本来不及跑完异步清理时才会残留，
 # 这里兜底清扫。
 _PROFILE_STALE_SECONDS = 1800.0
-_swept = False
+# 本进程自己留下的临时目录不能用「PID 还活着」来判断——那个 PID 就是自己，
+# 永远活着，于是每次解析漏下的浏览器越堆越多（实测 78 分钟还挂着 4 个）。
+# 对自家目录改用 mtime：解析最长也就几十秒，超过这个时间还没被动过就是残留。
+_OWN_PROFILE_STALE_SECONDS = 600.0
+# 清扫是「周期性」而非「每进程一次」：进程活得久时残留会一直累积。
+_SWEEP_INTERVAL_SECONDS = 600.0
+_swept_at = 0.0
+
+#: CDP 内部页前缀——这些页面不能作为导航目标。
+_INTERNAL_PAGE_PREFIXES = ("edge://", "chrome://", "devtools://", "about:blank#")
+
+
+def _pick_page_target(targets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """从 CDP ``/json/list`` 里挑一个真正能导航的页面目标。
+
+    Edge/Chrome 用全新用户目录启动时会**额外**开一个内部页
+    （``edge://sync-confirmation-dialog/`` 之类），它在列表里排在命令行给的
+    ``about:blank`` **前面**。原来直接取第一个 ``type == "page"`` 会连上这个
+    内部页：导航落在它身上，而 ``about:blank`` 一直是空白——现象就是「浏览器
+    起来了，但页面没进抖音」，解析白等一场（实测 09:35 那次就是这么卡的）。
+
+    优先 ``about:blank``（我们显式指定的那个），其次任何非内部页。
+    """
+    pages = [
+        target
+        for target in targets
+        if target.get("type") == "page" and target.get("webSocketDebuggerUrl")
+    ]
+    if not pages:
+        return None
+    for page in pages:
+        if str(page.get("url", "")).startswith("about:blank"):
+            return page
+    for page in pages:
+        url = str(page.get("url", "")).lower()
+        if url.startswith(_INTERNAL_PAGE_PREFIXES):
+            continue
+        return page
+    return pages[0]
 
 
 def _pid_alive(pid: int) -> bool:
@@ -531,15 +569,27 @@ def _sweep_stale_profiles(max_age: float = _PROFILE_STALE_SECONDS) -> int:
             pid = int(owner)
         except ValueError:
             pid = 0
-        if pid:
-            if _pid_alive(pid):
+        if pid and pid != os.getpid() and _pid_alive(pid):
+            # 别的实例正在用，跳过。
+            continue
+        if pid == os.getpid():
+            # 本进程自己留下的：PID 永远「活着」，只能靠 mtime 判断。
+            try:
+                if now - entry.stat().st_mtime < _OWN_PROFILE_STALE_SECONDS:
+                    continue
+            except OSError:
                 continue
-        else:
+        elif not pid:
+            # 解析不出 PID 的旧目录：退回按 mtime 判断。
             try:
                 if now - entry.stat().st_mtime < max_age:
                     continue
             except OSError:
                 continue
+        # 其余情况（PID 已消失）就是异常退出的残留，直接收掉。
+        # 先按 profile 把浏览器进程树收干净，再删目录：否则目录被占着删不掉，
+        # 而且孤儿进程会一直吃内存（taskkill /T 只对还活着的根进程有效）。
+        _kill_by_profile(entry.path)
         shutil.rmtree(entry.path, ignore_errors=True)
         if not Path(entry.path).exists():
             removed += 1
@@ -547,15 +597,58 @@ def _sweep_stale_profiles(max_age: float = _PROFILE_STALE_SECONDS) -> int:
 
 
 def _sweep_once() -> None:
-    """每个进程只扫一次，别让每次解析都去遍历临时目录。"""
-    global _swept
-    if _swept:
+    """周期性清扫临时目录（默认最多每 10 分钟一次）。
+
+    原来写的是「每个进程只扫一次」，但进程一开就是几小时，期间每次解析漏下的
+    浏览器会一直累积（实测 78 分钟堆了 4 个无头 Edge）。改成按时间间隔节流。
+    """
+    global _swept_at
+    now = time.time()
+    if now - _swept_at < _SWEEP_INTERVAL_SECONDS:
         return
-    _swept = True
+    _swept_at = now
     try:
         _sweep_stale_profiles()
     except Exception:
         pass
+
+
+def _kill_by_profile(profile: str) -> int:
+    """按 ``--user-data-dir`` 杀掉该临时目录下的**所有**浏览器进程。
+
+    ``taskkill /T`` 只对**还活着的根进程**有效：Chromium 的根进程一旦先退出，
+    剩下的 renderer/gpu/utility 就成孤儿，按 PID 再也找不到它们，会一直占着
+    临时目录吃内存。按命令行里的 ``--user-data-dir`` 匹配才能收干净。
+    返回杀掉的进程数；psutil 不可用时静默返回 0。
+    """
+    if not profile:
+        return 0
+    try:
+        import psutil
+    except Exception:
+        return 0
+    marker = f"--user-data-dir={profile}".lower()
+    killed = 0
+    try:
+        processes = list(psutil.process_iter(["pid", "name"]))
+    except Exception:
+        return 0
+    for proc in processes:
+        try:
+            name = str(proc.info.get("name") or "").lower()
+            if "msedge" not in name and "chrome" not in name:
+                continue
+            cmdline = proc.cmdline()
+        except Exception:
+            continue
+        if not any(marker in str(part).lower() for part in cmdline):
+            continue
+        try:
+            proc.kill()
+            killed += 1
+        except Exception:
+            pass
+    return killed
 
 
 def _kill_tree(process: "subprocess.Popen | None") -> None:
@@ -596,6 +689,9 @@ def _reap(process: "subprocess.Popen | None", profile: str) -> None:
     _kill_tree(process)
     if not profile:
         return
+    # 兜底：根进程可能已经先退出，剩下的 renderer/gpu 成孤儿，按 PID 杀不到，
+    # 只能按 --user-data-dir 认领（否则目录被占着删不掉，进程也一直挂着）。
+    _kill_by_profile(profile)
     for _ in range(6):
         shutil.rmtree(profile, ignore_errors=True)
         if not Path(profile).exists():
