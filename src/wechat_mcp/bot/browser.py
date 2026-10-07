@@ -204,6 +204,26 @@ _LAUNCH_FLAGS = (
     "--remote-allow-origins=*",
 )
 
+#: 启动失败后最多尝试几次（含首次）。Chromium 系偶发「秒退」——比如 Edge 后台
+#: 正在做版本切换，新起的进程会把命令行交接给新版本然后自己退出（实测 2.86 秒就退、
+#: 系统事件日志里连崩溃记录都没有）。这类失败重试一次基本就好，不必让整条链接
+#: 解析白跑。
+_START_ATTEMPTS = 2
+_RETRY_DELAY_SECONDS = 1.0
+#: 退出诊断里回显 stderr 的最大字符数。
+_STDERR_TAIL_CHARS = 600
+#: 浏览器 stderr 的落盘文件名。放在临时 profile 目录里，随目录一起被清掉。
+_STDERR_NAME = "_wechat-mcp-stderr.log"
+
+
+class BrowserExitedError(RuntimeError):
+    """浏览器进程在调试端口就绪前就退出了。
+
+    单列一种异常，是为了和「端口迟迟不就绪」区分开：前者**可重试**（见
+    :data:`_START_ATTEMPTS`），后者重试只是白等——所以 :meth:`BrowserSession.start`
+    只对这一个异常做重试。
+    """
+
 
 class BrowserSession:
     """启动一个临时浏览器实例，并提供一个页面用于取数据。
@@ -223,9 +243,11 @@ class BrowserSession:
     ) -> None:
         self._log = logger or (lambda level, message: None)
         self._timeout = float(timeout)
+        self._fixed_port = bool(port)
         self._port = port or _free_port()
         self._process: subprocess.Popen | None = None
         self._profile = ""
+        self._stderr_path = ""
         self._ws: _WebSocket | None = None
         self._message_id = 0
         self._pending: dict[int, dict[str, Any]] = {}
@@ -239,7 +261,37 @@ class BrowserSession:
             raise RuntimeError(
                 "未找到 Chrome / Edge，无法用浏览器方式解析（可安装 Edge 后重试）"
             )
+        attempts = max(1, _START_ATTEMPTS)
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._start_once(exe)
+            except BrowserExitedError as exc:
+                # 秒退是可重试的：收干净再起一次。
+                last_error = exc
+                self.close()
+                if attempt >= attempts:
+                    break
+                self._log(
+                    "warning",
+                    f"浏览器启动后立刻退出（第 {attempt}/{attempts} 次）：{exc}；"
+                    f"{_RETRY_DELAY_SECONDS:.0f} 秒后重试",
+                )
+                time.sleep(_RETRY_DELAY_SECONDS)
+            except Exception:
+                # 其它失败（找不到浏览器、端口迟迟不就绪）重试只是白等。
+                self.close()
+                raise
+        if last_error is None:  # pragma: no cover - attempts >= 1 时走不到
+            last_error = RuntimeError("浏览器启动失败")
+        raise last_error
+
+    def _start_once(self, exe: str) -> "BrowserSession":
+        """起一次浏览器；是否重试由 :meth:`start` 决定。"""
         _sweep_once()
+        if not self._fixed_port:
+            # 上一次尝试可能留下还没完全释放的调试端口，重试时换一个。
+            self._port = _free_port()
         # 目录名带上自己的 PID，方便下次启动识别「哪些是残留」。
         self._profile = tempfile.mkdtemp(
             prefix=f"{_PROFILE_PREFIX}{os.getpid()}-"
@@ -252,16 +304,72 @@ class BrowserSession:
             "about:blank",
         ]
         creation = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
-        self._process = subprocess.Popen(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation,
-        )
+        sink = self._open_stderr_sink()
+        try:
+            self._process = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=sink,
+                creationflags=creation,
+            )
+        finally:
+            if sink is not None:
+                # 子进程已经继承了这份句柄，自己这份可以关掉：既不留多余句柄，
+                # 也让 profile 目录能被正常删除。
+                try:
+                    sink.close()
+                except OSError:  # pragma: no cover - 关不掉也不影响主流程
+                    pass
         self._ws = self._connect_page()
         self._call("Network.enable")
         self._call("Page.enable")
         return self
+
+    # -- 启动失败的诊断 --------------------------------------------------- #
+
+    def _open_stderr_sink(self):
+        """打开浏览器 stderr 的落盘文件，返回可交给 ``Popen`` 的句柄。
+
+        原来 stderr 直接丢进 ``DEVNULL``，浏览器秒退时**退出码和原因全部丢弃**，
+        只能靠时间差和系统事件日志反推（见 2026-10-07 那次排查）。改成落文件，
+        失败时把尾部回显进日志。文件放在临时 profile 目录里，随目录一起被清掉。
+        """
+        self._stderr_path = ""
+        if not self._profile:
+            return None
+        path = os.path.join(self._profile, _STDERR_NAME)
+        try:
+            handle = open(path, "wb")
+        except OSError:  # pragma: no cover - 极少数权限/占用情况
+            return None
+        self._stderr_path = path
+        return handle
+
+    def _read_stderr_tail(self) -> str:
+        """读回 stderr 落盘文件的尾部；读不到返回空串。"""
+        if not self._stderr_path:
+            return ""
+        try:
+            with open(self._stderr_path, "rb") as handle:
+                blob = handle.read()
+        except OSError:
+            return ""
+        text = " ".join(blob.decode("utf-8", "replace").split())
+        if len(text) > _STDERR_TAIL_CHARS:
+            text = "…" + text[-_STDERR_TAIL_CHARS:]
+        return text
+
+    def _exit_diagnosis(self) -> str:
+        """浏览器提前退出时，拼一条能直接定位原因的说明。"""
+        code = self._process.poll() if self._process is not None else None
+        text = f"浏览器进程已退出（退出码 {code}）"
+        tail = self._read_stderr_tail()
+        if tail:
+            return f"{text}；stderr：{tail}"
+        return (
+            f"{text}；stderr 为空。Chromium 系在版本切换/更新待生效时会静默交接给"
+            "新进程后自己退出，重试通常可恢复"
+        )
 
     def _debugger_url(self, kind: str) -> str:
         url = f"http://127.0.0.1:{self._port}/json/{kind}"
@@ -273,7 +381,7 @@ class BrowserSession:
         last_error = ""
         while time.time() < deadline:
             if self._process and self._process.poll() is not None:
-                raise RuntimeError("浏览器进程已退出")
+                raise BrowserExitedError(self._exit_diagnosis())
             try:
                 targets = json.loads(self._debugger_url("list"))
                 chosen = _pick_page_target(targets)
@@ -298,6 +406,9 @@ class BrowserSession:
             self._ws = None
         process, profile = self._process, self._profile
         self._process, self._profile = None, ""
+        # stderr 落盘文件在 profile 目录里，交给 _reap 一起删；这里只断开引用，
+        # 免得下一次启动的 _exit_diagnosis 读到上一个会话的旧文件。
+        self._stderr_path = ""
         if blocking:
             _reap(process, profile)
         else:

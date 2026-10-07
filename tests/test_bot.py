@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -2515,6 +2516,132 @@ class BrowserBridgeTests(unittest.TestCase):
         targets = [{"type": "iframe", "url": "about:blank", "webSocketDebuggerUrl": "ws://a"}]
         self.assertIsNone(browser_mod._pick_page_target(targets))
         self.assertIsNone(browser_mod._pick_page_target([]))
+
+
+class BrowserStartDiagnosisTests(unittest.TestCase):
+    """浏览器「秒退」时的诊断与重试。
+
+    回归点：2026-10-07 两次链接解析只用了约 3 秒就报「浏览器进程已退出」，
+    而成功的那次要 11 秒——浏览器一被拉起就自己退了。当时 stderr 写死
+    ``DEVNULL``，退出码和原因全部丢弃，只能靠时间差和系统事件日志反推。
+    """
+
+    def _session(self):
+        return browser_mod.BrowserSession(logger=lambda level, message: None)
+
+    def _with_profile(self, session):
+        session._profile = tempfile.mkdtemp(
+            prefix=browser_mod._PROFILE_PREFIX + "unittest-"
+        )
+        self.addCleanup(shutil.rmtree, session._profile, ignore_errors=True)
+
+    def test_stderr_lands_in_the_profile_dir(self):
+        session = self._session()
+        self._with_profile(session)
+        handle = session._open_stderr_sink()
+        self.assertIsNotNone(handle)
+        handle.write(b"line one\nline two\n")
+        handle.close()
+        self.assertEqual(session._read_stderr_tail(), "line one line two")
+        self.assertTrue(
+            session._stderr_path.startswith(session._profile),
+            "stderr 落盘文件要放在临时 profile 里，才能随目录一起被清掉",
+        )
+
+    def test_stderr_tail_is_truncated(self):
+        session = self._session()
+        self._with_profile(session)
+        handle = session._open_stderr_sink()
+        handle.write(b"x" * (browser_mod._STDERR_TAIL_CHARS + 500))
+        handle.close()
+        tail = session._read_stderr_tail()
+        self.assertEqual(len(tail), browser_mod._STDERR_TAIL_CHARS + 1)
+        self.assertTrue(tail.startswith("…"))
+
+    def test_read_stderr_tail_without_sink_is_empty(self):
+        self.assertEqual(self._session()._read_stderr_tail(), "")
+
+    def test_exit_diagnosis_reports_code_and_stderr(self):
+        session = self._session()
+        self._with_profile(session)
+        handle = session._open_stderr_sink()
+        handle.write("Failed to bind devtools port".encode("utf-8"))
+        handle.close()
+        session._process = SimpleNamespace(poll=lambda: 21)
+        text = session._exit_diagnosis()
+        self.assertIn("退出码 21", text)
+        self.assertIn("Failed to bind devtools port", text)
+
+    def test_exit_diagnosis_explains_empty_stderr(self):
+        session = self._session()
+        session._process = SimpleNamespace(poll=lambda: 0)
+        text = session._exit_diagnosis()
+        self.assertIn("退出码 0", text)
+        self.assertIn("stderr 为空", text)
+
+    def test_start_retries_once_after_browser_exit(self):
+        session = self._session()
+        calls = []
+
+        def fake_start_once(exe):
+            calls.append(exe)
+            if len(calls) == 1:
+                raise browser_mod.BrowserExitedError("浏览器进程已退出（退出码 0）")
+            return session
+
+        with mock.patch.object(browser_mod, "find_browser", return_value="edge.exe"):
+            with mock.patch.object(session, "_start_once", side_effect=fake_start_once):
+                with mock.patch.object(browser_mod.time, "sleep") as sleeper:
+                    self.assertIs(session.start(), session)
+        self.assertEqual(len(calls), 2, "第一次秒退后应重试一次")
+        sleeper.assert_called_once_with(browser_mod._RETRY_DELAY_SECONDS)
+
+    def test_start_gives_up_after_attempts(self):
+        session = self._session()
+        calls = []
+
+        def always_exit(exe):
+            calls.append(exe)
+            raise browser_mod.BrowserExitedError("浏览器进程已退出（退出码 0）")
+
+        with mock.patch.object(browser_mod, "find_browser", return_value="edge.exe"):
+            with mock.patch.object(session, "_start_once", side_effect=always_exit):
+                with mock.patch.object(browser_mod.time, "sleep"):
+                    with self.assertRaises(browser_mod.BrowserExitedError):
+                        session.start()
+        self.assertEqual(len(calls), browser_mod._START_ATTEMPTS)
+
+    def test_start_does_not_retry_port_timeouts(self):
+        """端口迟迟不就绪是另一回事，重试只是白等 30 秒。"""
+        session = self._session()
+        calls = []
+
+        def port_never_ready(exe):
+            calls.append(exe)
+            raise RuntimeError("浏览器调试端口未就绪：Connection refused")
+
+        with mock.patch.object(browser_mod, "find_browser", return_value="edge.exe"):
+            with mock.patch.object(session, "_start_once", side_effect=port_never_ready):
+                with mock.patch.object(browser_mod.time, "sleep") as sleeper:
+                    with self.assertRaises(RuntimeError):
+                        session.start()
+        self.assertEqual(len(calls), 1, "端口没就绪不该重试")
+        sleeper.assert_not_called()
+
+    def test_start_without_browser_reports_clearly(self):
+        session = self._session()
+        with mock.patch.object(browser_mod, "find_browser", return_value=""):
+            with self.assertRaises(RuntimeError) as ctx:
+                session.start()
+        self.assertIn("未找到 Chrome / Edge", str(ctx.exception))
+
+    def test_close_forgets_stderr_path(self):
+        session = self._session()
+        self._with_profile(session)
+        session._open_stderr_sink().close()
+        self.assertTrue(session._stderr_path)
+        session.close()
+        self.assertEqual(session._stderr_path, "", "下次启动不该读到上一个会话的旧文件")
 
 
 class _RaisingBrowserSession:

@@ -1,6 +1,6 @@
 [project]
 name = "wechat-mcp"
-version = "0.8.12"
+version = "0.8.13"
 description = "WeChat MCP Server - 面向通用 AI Agent 的微信桌面自动化工具服务"
 requires-python = ">=3.10"
 dependencies = ["mcp>=2"]
