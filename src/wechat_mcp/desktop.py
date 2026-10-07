@@ -14,6 +14,7 @@ pywebview 6.x 不支持把 ``async def`` 暴露给 JS（其桥接无 asyncio 集
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import io
 import sys
 import threading
@@ -60,6 +61,21 @@ def window_icon() -> Path | None:
     return None
 
 
+#: 标记「当前这条日志正从界面 sink 回流进引擎」。
+#:
+#: 为什么需要：loguru 的界面 sink 会把输出送进 ``UI_LOG.emit`` → ``engine.log``
+#: → ``on_log`` → ``forward_engine_log`` → 又交回 loguru。界面 sink 自己能用
+#: record 上的 ``ENGINE_LOG_MARK`` 过滤掉回流，但**文件 sink 不认这个标记**，
+#: 于是同一条桥接层日志会落盘两次（一次原样、一次带 ``[引擎]`` 前缀）。
+#:
+#: 这里在调用 ``engine.log`` 期间置位，``forward_engine_log`` 见到置位就直接返回。
+#: 界面 sink 是同步调用（没有 ``enqueue=True``），所以 contextvar 能可靠地跨越
+#: 这条调用链——即便日志来自别的线程，置位与检查也在同一调用栈里完成。
+_ENGINE_FORWARDING: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "wechat_mcp_engine_forwarding", default=False
+)
+
+
 class _UiLogSink:
     """把控制台输出并入界面「运行日志」。
 
@@ -80,7 +96,7 @@ class _UiLogSink:
             self._engine = engine
             pending, self._pending = self._pending, deque(maxlen=200)
         for level, line in pending:
-            engine.log(level, line)
+            self._feed(engine, level, line)
 
     def emit(self, level: str, message: str) -> None:
         line = str(message).strip()
@@ -91,7 +107,20 @@ class _UiLogSink:
             if engine is None:
                 self._pending.append((level, line))
                 return
-        engine.log(level, line)
+        self._feed(engine, level, line)
+
+    @staticmethod
+    def _feed(engine: BotEngine, level: str, line: str) -> None:
+        """把一条日志交给引擎，并在此期间标记「正在回流」。
+
+        置位是为了让 ``forward_engine_log`` 认出这条日志本来就来自 loguru，
+        不要再转发一次（否则桥接层日志会在文件里出现两遍）。
+        """
+        token = _ENGINE_FORWARDING.set(True)
+        try:
+            engine.log(level, line)
+        finally:
+            _ENGINE_FORWARDING.reset(token)
 
 
 # 全局唯一：loguru sink、stdout/stderr 重定向与桌面 API 共用同一个收集器。
@@ -107,6 +136,49 @@ _LOGURU_LEVELS = {
     "ERROR": "error",
     "CRITICAL": "error",
 }
+
+# 引擎日志级别 → loguru 级别名（方向与上面相反）。
+_ENGINE_LEVELS = {
+    "debug": "DEBUG",
+    "info": "INFO",
+    "success": "INFO",
+    "warning": "WARNING",
+    "error": "ERROR",
+}
+
+#: 转发到 loguru 的引擎日志会带上这个标记，界面 sink 据此跳过（避免重复 + 递归）。
+ENGINE_LOG_MARK = "_engine_forwarded"
+
+
+def forward_engine_log(line: Any) -> None:
+    """把引擎自己的运行日志转发给 loguru，让它们也能**落盘**。
+
+    为什么需要：``UI_LOG.attach(engine)`` 只把引擎日志塞进**内存**里的界面日志
+    （界面靠轮询 ``get_logs()`` 显示），而文件 sink 挂在 loguru 上。于是日志文件
+    里只有桥接层/适配层的话——引擎自己的判断（「已发送链接提示」「开始下载链接
+    内容」「下载失败或超出体积上限，已跳过」…）**一条都没有**。现象就是
+    「链接发了、提示回了、然后什么都没有」时，翻日志文件**查不出任何原因**。
+
+    必须打标记：``UI_LOG.emit`` 最终会调 ``engine._log``，若不过滤就会
+    「引擎日志 → loguru → 界面 sink → engine._log → …」无限递归。
+
+    另外要拦住**回流**：桥接层用 loguru 打的日志会经界面 sink 回到引擎，此时
+    ``_ENGINE_FORWARDING`` 已置位——那条日志本来就在 loguru 手里（文件 sink 已经
+    写过一次），再转发就会在文件里出现两遍（一遍原样、一遍带 ``[引擎]`` 前缀）。
+    """
+    if _ENGINE_FORWARDING.get():
+        return
+    try:
+        from loguru import logger
+    except Exception:  # noqa: BLE001 - 没有 loguru 时静默跳过
+        return
+    level = _ENGINE_LEVELS.get(str(getattr(line, "level", "info")).lower(), "INFO")
+    try:
+        logger.bind(**{ENGINE_LOG_MARK: True}).log(
+            level, f"[引擎] {getattr(line, 'message', line)}"
+        )
+    except Exception:  # noqa: BLE001 - 写日志失败不该影响运行
+        pass
 
 
 def _guess_level(text: str) -> str:
@@ -228,6 +300,10 @@ def install_console_capture() -> None:
                 format="{message}",
                 colorize=False,
                 level="INFO",
+                # 引擎日志已经由 UI_LOG.attach 进过界面了，转发到 loguru 只是为了让
+                # 它们落盘；这里跳过，既避免界面重复显示，也避免
+                # 「引擎日志 → loguru → 界面 sink → engine._log」无限递归。
+                filter=lambda record: not record["extra"].get(ENGINE_LOG_MARK),
             )
         except Exception:  # noqa: BLE001 - 挂载失败不影响界面运行
             pass
@@ -281,6 +357,8 @@ class DesktopApi:
         self.engine = BotEngine(self.adapter, self.config)
         # 引擎就绪后接管控制台输出，连接微信期间的日志即可直接显示到界面。
         UI_LOG.attach(self.engine)
+        # 界面那份只在内存里（进程一退就没了），再转发一份给 loguru 才能落盘。
+        self.engine.on_log = forward_engine_log
         # 连接失败不阻塞界面，用户可在状态页重连。
         await self.adapter.connect()
         if self.config.enabled:

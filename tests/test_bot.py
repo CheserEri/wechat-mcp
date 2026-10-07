@@ -2370,6 +2370,93 @@ class PrivateUser32Tests(unittest.TestCase):
         bridge._window_process_ids = set()
         self.assertEqual(bridge._wechat_pids(SimpleNamespace()), set())
 
+
+class DialogSetTextTests(unittest.TestCase):
+    """往文件对话框写路径：读回校验 + 重试。
+
+    回归点（0.8.10 上线后实测）：同一个下载目录下的两个文件，前一个写入被
+    「读回校验不一致」吞掉、20 秒后的后一个一次成功——对话框刚弹出的瞬间控件还没
+    就绪。重试只要几十毫秒，比退回剪贴板（要截屏找输入框）划算得多。
+    """
+
+    @staticmethod
+    def _module():
+        return BridgeFileSendConfirmTests._module()
+
+    def test_readback_helpers_round_trip_on_a_real_edit(self):
+        """真建一个 EDIT 控件，验证 WM_SETTEXT/WM_GETTEXT 这条纯消息路径。"""
+        try:
+            import win32gui
+        except ImportError:  # pragma: no cover
+            self.skipTest("缺少 pywin32")
+
+        module = self._module()
+        try:
+            hwnd = win32gui.CreateWindow(
+                "EDIT", "", 0, 0, 0, 200, 24, 0, 0, 0, None
+            )
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"无法创建测试控件: {exc}")
+        if not hwnd:  # pragma: no cover
+            self.skipTest("CreateWindow 返回 0")
+        try:
+            path = r"C:\Users\chese\AppData\Roaming\wechat-mcp\downloads\tweet-1.png"
+            self.assertTrue(module._set_dialog_text(hwnd, path))
+            self.assertEqual(module._get_dialog_text(hwnd), path)
+        finally:
+            try:
+                win32gui.DestroyWindow(hwnd)
+            except Exception:  # pragma: no cover
+                pass
+
+    def test_retries_until_readback_matches(self):
+        """第一次读回不一致时重试，成功即返回 True。"""
+        module = self._module()
+        module.FILE_DIALOG_SETTEXT_INTERVAL = 0.0
+        reads = ["（还没就绪）", "C:/tmp/clip.mp4"]
+        calls = {"n": 0}
+
+        def fake_get(hwnd):
+            value = reads[min(calls["n"], len(reads) - 1)]
+            calls["n"] += 1
+            return value
+
+        module._get_dialog_text = fake_get
+        self.assertTrue(module._set_dialog_text(1, "C:/tmp/clip.mp4"))
+        self.assertEqual(calls["n"], 2, "应重试到读回一致")
+
+    def test_gives_up_and_reports_the_readback(self):
+        """一直写不进去 → 返回 False，并把**读回值**记进日志（否则没法排查）。"""
+        module = self._module()
+        module.FILE_DIALOG_SETTEXT_INTERVAL = 0.0
+        module._get_dialog_text = lambda hwnd: "被吞了"
+        logged = []
+        sink_id = module.logger.add(
+            lambda message: logged.append(message.record["message"]),
+            level="WARNING",
+        )
+        try:
+            self.assertFalse(module._set_dialog_text(1, "C:/tmp/clip.mp4"))
+        finally:
+            module.logger.remove(sink_id)
+        self.assertTrue(
+            any("被吞了" in line and "读回" in line for line in logged),
+            f"警告里应带上读回值，实际：{logged}",
+        )
+
+    def test_attempts_is_capped_at_one_minimum(self):
+        module = self._module()
+        module.FILE_DIALOG_SETTEXT_INTERVAL = 0.0
+        calls = {"n": 0}
+
+        def fake_get(hwnd):
+            calls["n"] += 1
+            return "x"
+
+        module._get_dialog_text = fake_get
+        self.assertFalse(module._set_dialog_text(1, "y", attempts=0))
+        self.assertEqual(calls["n"], 1)
+
     def test_private_handle_is_cached_and_distinct(self):
         import ctypes
 

@@ -13,7 +13,7 @@
 ;   下载/资源管理器解压产生），从根上避免 pythonnet 被 .NET 拒绝加载而黑屏。
 
 #ifndef AppVersion
-  #define AppVersion "0.8.10"
+  #define AppVersion "0.8.11"
 #endif
 
 #define AppName "灵语"

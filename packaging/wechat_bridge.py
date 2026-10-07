@@ -796,22 +796,54 @@ def _close_file_dialog(dlg: int) -> None:
         logger.debug(f"关闭文件对话框失败: {exc}")
 
 
-def _set_dialog_text(hwnd: int, text: str) -> bool:
-    """用 ``WM_SETTEXT`` 直接写控件文本并读回校验。
+def _get_dialog_text(hwnd: int) -> str:
+    """读控件文本（``WM_GETTEXTLENGTH`` + ``WM_GETTEXT``）。"""
+    length = int(_send_msg(hwnd, WM_GETTEXTLENGTH))
+    buf = ctypes.create_unicode_buffer(max(1, length) + 2)
+    _send_msg(hwnd, WM_GETTEXT, length + 1, ctypes.cast(buf, ctypes.c_void_p))
+    return buf.value
 
-    比 ``SendInput`` 逐字打路径快两个数量级（每字符 2 次系统调用），
-    也不受输入法干扰。
+
+#: 往文件对话框写路径的重试次数与间隔（秒）。
+FILE_DIALOG_SETTEXT_ATTEMPTS = 3
+FILE_DIALOG_SETTEXT_INTERVAL = 0.15
+
+
+def _set_dialog_text(hwnd: int, text: str, attempts: int = None) -> bool:
+    """用 ``WM_SETTEXT`` 写控件文本并**读回校验**（失败会重试几次）。
+
+    比 ``SendInput`` 逐字打路径快两个数量级（每字符 2 次系统调用），也不受输入法
+    干扰。
+
+    **为什么要重试**：0.8.10 上线后实测撞到过一次「读回校验不一致」——同一个
+    目录下的两个文件，前一个写入被吞掉、20 秒后的后一个一次成功。对话框刚弹出的
+    瞬间控件还没就绪，写入会丢。重试的代价只有几十毫秒，比直接退回剪贴板
+    （那条路要截屏找输入框）划算得多。
     """
-    try:
-        _send_msg(hwnd, WM_SETTEXT, 0, ctypes.c_wchar_p(text))
-        length = int(_send_msg(hwnd, WM_GETTEXTLENGTH))
-        buf = ctypes.create_unicode_buffer(length + 2)
-        _send_msg(hwnd, WM_GETTEXT, length + 1,
-                  ctypes.cast(buf, ctypes.c_void_p))
-        return buf.value == text
-    except Exception as exc:
-        logger.debug(f"写入文件对话框失败: {exc}")
-        return False
+    total = FILE_DIALOG_SETTEXT_ATTEMPTS if attempts is None else max(1, int(attempts))
+    last = None
+    for attempt in range(1, total + 1):
+        try:
+            _send_msg(hwnd, WM_SETTEXT, 0, ctypes.c_wchar_p(text))
+            last = _get_dialog_text(hwnd)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"写入文件对话框异常（第 {attempt}/{total} 次）: {exc}")
+            last = None
+        if last == text:
+            if attempt > 1:
+                logger.info(f"第 {attempt} 次写入文件对话框成功")
+            return True
+        logger.debug(
+            f"文件对话框读回不一致（第 {attempt}/{total} 次）："
+            f"期望 {text!r}，读回 {last!r}"
+        )
+        time.sleep(FILE_DIALOG_SETTEXT_INTERVAL)
+    # 把**读回值**写进日志：只写「失败」的话，下次再出问题还是查不出原因。
+    logger.warning(
+        f"往文件对话框写入路径失败：期望 {text!r}，读回 {last!r}"
+        f"（已试 {total} 次）"
+    )
+    return False
 
 
 def _click_dialog_control(hwnd: int) -> bool:
@@ -3201,7 +3233,7 @@ class WeChatBridge:
             _close_file_dialog(dlg)
             return False
         if not _set_dialog_text(edit, file_path):
-            logger.warning("往文件对话框写入路径失败（读回校验不一致）")
+            # 具体读回值已由 _set_dialog_text 记在上一行，这里不重复报。
             _close_file_dialog(dlg)
             return False
 
