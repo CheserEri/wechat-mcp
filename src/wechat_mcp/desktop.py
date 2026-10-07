@@ -24,7 +24,7 @@ from typing import Any
 import webview
 
 from .adapters.deepseekgirl import DeepSeekGirlAdapter
-from .bot import BotConfig, BotEngine
+from .bot import BotConfig, BotEngine, default_config_path
 from .bot.llm import LLMClient, LLMError
 from .config import AdapterConfig
 from .unblock import unblock_bundled_assemblies
@@ -169,6 +169,43 @@ class _TeeStream(io.TextIOBase):
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(self._original, name)
+
+
+def log_dir() -> Path:
+    """运行日志目录：``%APPDATA%\\wechat-mcp\\logs``。"""
+    return default_config_path().parent / "logs"
+
+
+def install_file_logging(level: str = "INFO", retention_days: int = 7) -> Path | None:
+    """给 loguru 再挂一个**文件** sink，让运行日志能落盘回溯。
+
+    界面上的「运行日志」只在内存里，进程一退出就没了——出问题（比如「链接发了、
+    提示也回了、然后什么都没有」）时完全没有线索，只能靠猜。这里把同样的日志
+    按天写进 ``logs/app-YYYY-MM-DD.log``，保留最近若干天。
+
+    返回日志文件路径；挂载失败返回 ``None``（不能因为日志影响程序启动）。
+    """
+    try:
+        from loguru import logger
+    except Exception:  # noqa: BLE001 - 没有 loguru 时静默跳过
+        return None
+    try:
+        directory = log_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            str(directory / "app-{time:YYYY-MM-DD}.log"),
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}",
+            level=level,
+            encoding="utf-8",
+            enqueue=True,  # 跨线程写日志，串行化到队列，避免多线程交叉
+            rotation="00:00",
+            retention=f"{max(1, int(retention_days))} days",
+            backtrace=False,
+            diagnose=False,
+        )
+    except Exception:  # noqa: BLE001 - 落盘失败不影响界面运行
+        return None
+    return directory
 
 
 def install_console_capture() -> None:
@@ -346,6 +383,8 @@ def _show_fatal(message: str) -> None:
 def run() -> None:
     # 先把控制台输出接管到界面运行日志，再启动窗口；这样启动期的日志也不会丢。
     install_console_capture()
+    # 同一份日志再落盘一份：界面日志进程一退就没了，出问题时无从回溯。
+    install_file_logging()
 
     index = webui_dir() / "index.html"
     if not index.is_file():
